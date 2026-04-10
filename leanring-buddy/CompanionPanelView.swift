@@ -7,6 +7,7 @@
 //  like Loom's recording panel — dark, rounded, minimal, and special.
 //
 
+import AppKit
 import AVFoundation
 import SwiftUI
 
@@ -24,14 +25,6 @@ struct CompanionPanelView: View {
             permissionsCopySection
                 .padding(.top, 16)
                 .padding(.horizontal, 16)
-
-            if companionManager.hasCompletedOnboarding && companionManager.allPermissionsGranted {
-                Spacer()
-                    .frame(height: 12)
-
-                modelPickerRow
-                    .padding(.horizontal, 16)
-            }
 
             if !companionManager.allPermissionsGranted {
                 Spacer()
@@ -57,6 +50,14 @@ struct CompanionPanelView: View {
             //     showClickyCursorToggleRow
             //         .padding(.horizontal, 16)
             // }
+
+            if companionManager.hasCompletedOnboarding && companionManager.allPermissionsGranted {
+                Spacer()
+                    .frame(height: 16)
+
+                WorkspaceInventorySectionView(workspaceInventoryStore: companionManager.workspaceInventoryStore)
+                    .padding(.horizontal, 16)
+            }
 
             if companionManager.hasCompletedOnboarding && companionManager.allPermissionsGranted {
                 Spacer()
@@ -92,7 +93,7 @@ struct CompanionPanelView: View {
                     .frame(width: 8, height: 8)
                     .shadow(color: statusDotColor.opacity(0.6), radius: 4)
 
-                Text("Clicky")
+                Text("Flowee")
                     .font(.system(size: 14, weight: .semibold))
                     .foregroundColor(DS.Colors.textPrimary)
             }
@@ -142,7 +143,7 @@ struct CompanionPanelView: View {
             }
             .frame(maxWidth: .infinity, alignment: .leading)
         } else if companionManager.allPermissionsGranted {
-            Text("You're all set. Hit Start to meet Clicky.")
+            Text("You're all set. Hit Start to meet Flowee.")
                 .font(.system(size: 12, weight: .medium))
                 .foregroundColor(DS.Colors.textSecondary)
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -153,7 +154,7 @@ struct CompanionPanelView: View {
                     .font(.system(size: 12, weight: .bold))
                     .foregroundColor(DS.Colors.textSecondary)
 
-                Text("Some permissions were revoked. Grant all four below to keep using Clicky.")
+                Text("Some permissions were revoked. Grant all four below to keep using Flowee.")
                     .font(.system(size: 11))
                     .foregroundColor(DS.Colors.textTertiary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -161,7 +162,7 @@ struct CompanionPanelView: View {
             .frame(maxWidth: .infinity, alignment: .leading)
         } else {
             VStack(alignment: .leading, spacing: 6) {
-                Text("Hi, I'm Farza. This is Clicky.")
+                Text("Hi, I'm Farza. This is Flowee.")
                     .font(.system(size: 12, weight: .bold))
                     .foregroundColor(DS.Colors.textSecondary)
 
@@ -170,7 +171,7 @@ struct CompanionPanelView: View {
                     .foregroundColor(DS.Colors.textTertiary)
                     .fixedSize(horizontal: false, vertical: true)
 
-                Text("Nothing runs in the background. Clicky will only take a screenshot when you press the hot key. So, you can give that permission in peace. If you are still sus, eh, I can't do much there champ.")
+                Text("Nothing runs in the background. Flowee will only take a screenshot when you press the hot key. So, you can give that permission in peace. If you are still sus, eh, I can't do much there champ.")
                     .font(.system(size: 11))
                     .foregroundColor(Color(red: 0.9, green: 0.4, blue: 0.4))
                     .fixedSize(horizontal: false, vertical: true)
@@ -545,7 +546,7 @@ struct CompanionPanelView: View {
 
 
 
-    // MARK: - Show Clicky Cursor Toggle
+    // MARK: - Show Flowee Toggle
 
     private var showClickyCursorToggleRow: some View {
         HStack {
@@ -555,7 +556,7 @@ struct CompanionPanelView: View {
                     .foregroundColor(DS.Colors.textTertiary)
                     .frame(width: 16)
 
-                Text("Show Clicky")
+                Text("Show Flowee")
                     .font(.system(size: 13, weight: .medium))
                     .foregroundColor(DS.Colors.textSecondary)
             }
@@ -654,9 +655,9 @@ struct CompanionPanelView: View {
                     .font(.system(size: 12, weight: .medium))
 
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("Got feedback? DM me")
+                    Text("Got feedback? DM us.")
                         .font(.system(size: 12, weight: .semibold))
-                    Text("Bugs, ideas, anything — I read every message.")
+                    Text("Bugs, ideas, anything — We read every message.")
                         .font(.system(size: 10))
                         .foregroundColor(DS.Colors.textTertiary)
                 }
@@ -688,31 +689,13 @@ struct CompanionPanelView: View {
                 HStack(spacing: 6) {
                     Image(systemName: "power")
                         .font(.system(size: 11, weight: .medium))
-                    Text("Quit Clicky")
+                    Text("Quit Flowee")
                         .font(.system(size: 12, weight: .medium))
                 }
                 .foregroundColor(DS.Colors.textTertiary)
             }
             .buttonStyle(.plain)
             .pointerCursor()
-
-            if companionManager.hasCompletedOnboarding {
-                Spacer()
-
-                Button(action: {
-                    companionManager.replayOnboarding()
-                }) {
-                    HStack(spacing: 6) {
-                        Image(systemName: "play.circle")
-                            .font(.system(size: 11, weight: .medium))
-                        Text("Watch Onboarding Again")
-                            .font(.system(size: 12, weight: .medium))
-                    }
-                    .foregroundColor(DS.Colors.textTertiary)
-                }
-                .buttonStyle(.plain)
-                .pointerCursor()
-            }
         }
     }
 
@@ -758,4 +741,475 @@ struct CompanionPanelView: View {
         }
     }
 
+}
+
+private struct WorkspaceEditorDraft {
+    var name: String = ""
+    var path: String = ""
+    var workspaceDescription: String = ""
+    var isEnabled: Bool = true
+}
+
+private struct WorkspaceInventorySectionView: View {
+    @ObservedObject var workspaceInventoryStore: WorkspaceInventoryStore
+    @State private var isExpanded = false
+    @State private var isAddingWorkspace = false
+    @State private var editingWorkspaceID: UUID?
+    @State private var workspaceEditorDraft = WorkspaceEditorDraft()
+    @State private var workspaceEditorErrorText: String?
+
+    var body: some View {
+        VStack(spacing: 8) {
+            Button(action: {
+                withAnimation(.easeInOut(duration: 0.18)) {
+                    isExpanded.toggle()
+                }
+            }) {
+                HStack(spacing: 8) {
+                    Image(systemName: "folder.badge.gearshape")
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundColor(DS.Colors.textTertiary)
+                        .frame(width: 16)
+
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Workspaces")
+                            .font(.system(size: 12, weight: .semibold))
+                            .foregroundColor(DS.Colors.textSecondary)
+
+                        Text(summaryText)
+                            .font(.system(size: 10))
+                            .foregroundColor(DS.Colors.textTertiary)
+                    }
+
+                    Spacer()
+
+                    Image(systemName: isExpanded ? "chevron.up" : "chevron.down")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundColor(DS.Colors.textTertiary)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 10)
+                .background(
+                    RoundedRectangle(cornerRadius: DS.CornerRadius.medium, style: .continuous)
+                        .fill(Color.white.opacity(0.06))
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: DS.CornerRadius.medium, style: .continuous)
+                        .stroke(DS.Colors.borderSubtle, lineWidth: 0.5)
+                )
+            }
+            .buttonStyle(.plain)
+            .pointerCursor()
+
+            if isExpanded {
+                VStack(alignment: .leading, spacing: 8) {
+                    if workspaceInventoryStore.workspaces.isEmpty {
+                        Text("No workspaces added yet. Flowee will only delegate into repos you add here.")
+                            .font(.system(size: 11))
+                            .foregroundColor(DS.Colors.textTertiary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    } else {
+                        ForEach(workspaceInventoryStore.workspaces) { workspace in
+                            workspaceRow(for: workspace)
+                        }
+                    }
+
+                    if isAddingWorkspace {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("New Workspace")
+                                .font(.system(size: 12, weight: .semibold))
+                                .foregroundColor(DS.Colors.textPrimary)
+
+                            workspaceEditor
+                        }
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 10)
+                        .background(
+                            RoundedRectangle(cornerRadius: DS.CornerRadius.medium, style: .continuous)
+                                .fill(Color.white.opacity(0.04))
+                        )
+                        .overlay(
+                            RoundedRectangle(cornerRadius: DS.CornerRadius.medium, style: .continuous)
+                                .stroke(DS.Colors.borderSubtle.opacity(0.8), lineWidth: 0.5)
+                        )
+                    }
+
+                    if let workspaceEditorErrorText {
+                        Text(workspaceEditorErrorText)
+                            .font(.system(size: 10, weight: .medium))
+                            .foregroundColor(DS.Colors.warning)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+
+                    Button(action: {
+                        beginAddingWorkspace()
+                    }) {
+                        HStack(spacing: 6) {
+                            Image(systemName: "plus")
+                                .font(.system(size: 10, weight: .bold))
+                            Text("Add Workspace")
+                                .font(.system(size: 11, weight: .semibold))
+                        }
+                        .foregroundColor(DS.Colors.textOnAccent)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 6)
+                        .background(
+                            Capsule()
+                                .fill(DS.Colors.accent)
+                        )
+                    }
+                    .buttonStyle(.plain)
+                    .pointerCursor()
+                }
+            }
+        }
+    }
+
+    private var summaryText: String {
+        let allowedWorkspaceCount = workspaceInventoryStore.enabledWorkspaces.count
+        if allowedWorkspaceCount == 1 {
+            return "1 allowed workspace"
+        }
+        return "\(allowedWorkspaceCount) allowed workspaces"
+    }
+
+    @ViewBuilder
+    private func workspaceRow(for workspace: WorkspaceInventoryStore.WorkspaceRecord) -> some View {
+        let isEditingCurrentWorkspace = editingWorkspaceID == workspace.id
+        let validationStatus = workspaceInventoryStore.validationStatus(for: workspace)
+
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .top, spacing: 8) {
+                VStack(alignment: .leading, spacing: 3) {
+                    HStack(spacing: 6) {
+                        Text(workspace.name)
+                            .font(.system(size: 12, weight: .semibold))
+                            .foregroundColor(DS.Colors.textPrimary)
+
+                        if workspace.isEnabled {
+                            statusBadge(text: "Allowed", color: DS.Colors.success)
+                        } else {
+                            statusBadge(text: "Disabled", color: DS.Colors.textTertiary)
+                        }
+
+                        if validationStatus != .valid, let warningText = validationStatus.userFacingDescription {
+                            statusBadge(text: warningText, color: DS.Colors.warning)
+                        }
+                    }
+
+                    Text(workspace.path)
+                        .font(.system(size: 10))
+                        .foregroundColor(DS.Colors.textTertiary)
+                        .lineLimit(2)
+                        .textSelection(.enabled)
+
+                    if !workspace.workspaceDescription.isEmpty {
+                        Text(workspace.workspaceDescription)
+                            .font(.system(size: 10))
+                            .foregroundColor(DS.Colors.textSecondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+
+                Spacer(minLength: 8)
+
+                HStack(spacing: 6) {
+                    Button(action: {
+                        beginEditingWorkspace(workspace)
+                    }) {
+                        Text(isEditingCurrentWorkspace ? "Editing" : "Edit")
+                            .font(.system(size: 10, weight: .semibold))
+                            .foregroundColor(DS.Colors.textSecondary)
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 4)
+                            .background(
+                                Capsule()
+                                    .stroke(DS.Colors.borderSubtle, lineWidth: 0.8)
+                            )
+                    }
+                    .buttonStyle(.plain)
+                    .pointerCursor()
+
+                    Button(action: {
+                        removeWorkspace(workspace)
+                    }) {
+                        Text("Remove")
+                            .font(.system(size: 10, weight: .semibold))
+                            .foregroundColor(DS.Colors.warning)
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 4)
+                            .background(
+                                Capsule()
+                                    .stroke(DS.Colors.warning.opacity(0.35), lineWidth: 0.8)
+                            )
+                    }
+                    .buttonStyle(.plain)
+                    .pointerCursor()
+                }
+            }
+
+            if isEditingCurrentWorkspace {
+                workspaceEditor
+            }
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 10)
+        .background(
+            RoundedRectangle(cornerRadius: DS.CornerRadius.medium, style: .continuous)
+                .fill(Color.white.opacity(0.04))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: DS.CornerRadius.medium, style: .continuous)
+                .stroke(DS.Colors.borderSubtle.opacity(0.8), lineWidth: 0.5)
+        )
+    }
+
+    private var workspaceEditor: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            workspaceEditorTextField(
+                title: "Name",
+                text: $workspaceEditorDraft.name,
+                placeholder: "Workspace name"
+            )
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Folder")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundColor(DS.Colors.textTertiary)
+
+                Text(workspaceEditorDraft.path)
+                    .font(.system(size: 10))
+                    .foregroundColor(DS.Colors.textSecondary)
+                    .lineLimit(3)
+                    .textSelection(.enabled)
+
+                Button(action: {
+                    chooseFolderForCurrentEditor()
+                }) {
+                    Text("Choose Folder")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundColor(DS.Colors.textSecondary)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 4)
+                        .background(
+                            Capsule()
+                                .stroke(DS.Colors.borderSubtle, lineWidth: 0.8)
+                        )
+                }
+                .buttonStyle(.plain)
+                .pointerCursor()
+            }
+
+            workspaceEditorTextField(
+                title: "Description",
+                text: $workspaceEditorDraft.workspaceDescription,
+                placeholder: "Optional context about this codebase"
+            )
+
+            HStack {
+                Text("Allowed for delegation")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundColor(DS.Colors.textSecondary)
+
+                Spacer()
+
+                Toggle("", isOn: $workspaceEditorDraft.isEnabled)
+                    .toggleStyle(.switch)
+                    .labelsHidden()
+                    .tint(DS.Colors.accent)
+                    .scaleEffect(0.8)
+            }
+
+            HStack(spacing: 8) {
+                Button(action: {
+                    saveCurrentWorkspaceEditor()
+                }) {
+                    Text("Save")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundColor(DS.Colors.textOnAccent)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 6)
+                        .background(
+                            Capsule()
+                                .fill(DS.Colors.accent)
+                        )
+                }
+                .buttonStyle(.plain)
+                .pointerCursor()
+
+                Button(action: {
+                    cancelEditing()
+                }) {
+                    Text("Cancel")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundColor(DS.Colors.textSecondary)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 6)
+                        .background(
+                            Capsule()
+                                .stroke(DS.Colors.borderSubtle, lineWidth: 0.8)
+                        )
+                }
+                .buttonStyle(.plain)
+                .pointerCursor()
+            }
+        }
+        .padding(.top, 2)
+    }
+
+    private func workspaceEditorTextField(
+        title: String,
+        text: Binding<String>,
+        placeholder: String
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(title)
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundColor(DS.Colors.textTertiary)
+
+            TextField(placeholder, text: text)
+                .textFieldStyle(.plain)
+                .font(.system(size: 12))
+                .foregroundColor(DS.Colors.textPrimary)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 8)
+                .background(
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .fill(Color.white.opacity(0.06))
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .stroke(DS.Colors.borderSubtle, lineWidth: 0.5)
+                )
+        }
+    }
+
+    private func statusBadge(text: String, color: Color) -> some View {
+        Text(text)
+            .font(.system(size: 9, weight: .semibold))
+            .foregroundColor(color)
+            .padding(.horizontal, 6)
+            .padding(.vertical, 2)
+            .background(
+                Capsule()
+                    .fill(color.opacity(0.12))
+            )
+    }
+
+    private func beginAddingWorkspace() {
+        workspaceEditorErrorText = nil
+
+        guard let folderPath = selectWorkspaceFolder(currentPath: nil) else {
+            return
+        }
+
+        isAddingWorkspace = true
+        editingWorkspaceID = nil
+        workspaceEditorDraft = WorkspaceEditorDraft(
+            name: URL(fileURLWithPath: folderPath).lastPathComponent,
+            path: folderPath,
+            workspaceDescription: "",
+            isEnabled: true
+        )
+    }
+
+    private func beginEditingWorkspace(_ workspace: WorkspaceInventoryStore.WorkspaceRecord) {
+        workspaceEditorErrorText = nil
+        isAddingWorkspace = false
+        editingWorkspaceID = workspace.id
+        workspaceEditorDraft = WorkspaceEditorDraft(
+            name: workspace.name,
+            path: workspace.path,
+            workspaceDescription: workspace.workspaceDescription,
+            isEnabled: workspace.isEnabled
+        )
+    }
+
+    private func cancelEditing() {
+        isAddingWorkspace = false
+        editingWorkspaceID = nil
+        workspaceEditorDraft = WorkspaceEditorDraft()
+        workspaceEditorErrorText = nil
+    }
+
+    private func chooseFolderForCurrentEditor() {
+        guard let selectedFolderPath = selectWorkspaceFolder(currentPath: workspaceEditorDraft.path) else {
+            return
+        }
+
+        workspaceEditorDraft.path = selectedFolderPath
+        if workspaceEditorDraft.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            workspaceEditorDraft.name = URL(fileURLWithPath: selectedFolderPath).lastPathComponent
+        }
+    }
+
+    private func saveCurrentWorkspaceEditor() {
+        workspaceEditorErrorText = nil
+
+        if workspaceEditorDraft.path.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            workspaceEditorErrorText = "Pick a folder before saving this workspace."
+            return
+        }
+
+        if let editingWorkspaceID,
+           let existingWorkspace = workspaceInventoryStore.workspaces.first(where: { $0.id == editingWorkspaceID }) {
+            do {
+                try workspaceInventoryStore.updateWorkspace(
+                    workspaceID: existingWorkspace.id,
+                    name: workspaceEditorDraft.name,
+                    path: workspaceEditorDraft.path,
+                    workspaceDescription: workspaceEditorDraft.workspaceDescription,
+                    isEnabled: workspaceEditorDraft.isEnabled,
+                    lastUsedDelegationRuntimeID: existingWorkspace.lastUsedDelegationRuntimeID
+                )
+                cancelEditing()
+            } catch {
+                workspaceEditorErrorText = error.localizedDescription
+            }
+            return
+        }
+
+        do {
+            try workspaceInventoryStore.addWorkspace(
+                name: workspaceEditorDraft.name,
+                path: workspaceEditorDraft.path,
+                workspaceDescription: workspaceEditorDraft.workspaceDescription,
+                isEnabled: workspaceEditorDraft.isEnabled
+            )
+            cancelEditing()
+        } catch {
+            workspaceEditorErrorText = error.localizedDescription
+        }
+    }
+
+    private func removeWorkspace(_ workspace: WorkspaceInventoryStore.WorkspaceRecord) {
+        workspaceEditorErrorText = nil
+        do {
+            try workspaceInventoryStore.removeWorkspace(workspaceID: workspace.id)
+            if editingWorkspaceID == workspace.id {
+                cancelEditing()
+            }
+        } catch {
+            workspaceEditorErrorText = error.localizedDescription
+        }
+    }
+
+    private func selectWorkspaceFolder(currentPath: String?) -> String? {
+        let openPanel = NSOpenPanel()
+        openPanel.canChooseFiles = false
+        openPanel.canChooseDirectories = true
+        openPanel.canCreateDirectories = false
+        openPanel.allowsMultipleSelection = false
+        openPanel.prompt = "Choose Workspace"
+        openPanel.message = "Select a repo or local code workspace Flowee is allowed to delegate into."
+
+        if let currentPath, !currentPath.isEmpty {
+            openPanel.directoryURL = URL(fileURLWithPath: currentPath)
+        }
+
+        let response = openPanel.runModal()
+        guard response == .OK else { return nil }
+        return openPanel.url?.path
+    }
 }

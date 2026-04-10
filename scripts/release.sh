@@ -5,7 +5,7 @@ set -euo pipefail
 export PATH="/opt/homebrew/bin:$PATH"
 
 # =============================================================================
-# release.sh — Automates the full release pipeline for makesomething
+# release.sh — Automates the full release pipeline for Clicky
 #
 # What it does (in order):
 #   1. Auto-detects version + build from the latest GitHub Release
@@ -34,7 +34,7 @@ export PATH="/opt/homebrew/bin:$PATH"
 # ── Configuration ────────────────────────────────────────────────────────────
 
 SCHEME="leanring-buddy"
-APP_NAME="makesomething"
+APP_NAME="Clicky"
 PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 BUILD_DIR="${PROJECT_DIR}/build"
 ARCHIVE_PATH="${BUILD_DIR}/${APP_NAME}.xcarchive"
@@ -43,7 +43,13 @@ DMG_OUTPUT_DIR="${BUILD_DIR}/dmg"
 RELEASES_DIR="${PROJECT_DIR}/releases"  # where generate_appcast reads DMGs from
 DMG_BACKGROUND="${PROJECT_DIR}/dmg-background.png"
 
-GITHUB_REPO="julianjear/makesomething-mac-app"
+GITHUB_REPO="${GITHUB_REPO:-}"
+
+if [ -z "${GITHUB_REPO}" ]; then
+    echo "❌ GITHUB_REPO is required for distribution releases."
+    echo "   Example: GITHUB_REPO=your-org/clicky-releases ./scripts/release.sh"
+    exit 1
+fi
 
 # Sparkle tools (auto-discovered from Xcode's SPM cache)
 SPARKLE_BIN=$(find ~/Library/Developer/Xcode/DerivedData/leanring-buddy*/SourcePackages/artifacts/sparkle/Sparkle/bin -maxdepth 0 2>/dev/null | head -1)

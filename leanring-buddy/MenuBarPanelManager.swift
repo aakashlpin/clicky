@@ -66,7 +66,7 @@ final class MenuBarPanelManager: NSObject {
         guard let button = statusItem?.button else { return }
 
         button.image = makeClickyMenuBarIcon()
-        button.image?.isTemplate = true
+        button.image?.isTemplate = false
         button.action = #selector(statusItemClicked)
         button.target = self
     }
@@ -100,8 +100,12 @@ final class MenuBarPanelManager: NSObject {
         path.line(to: rotate(bottomRight))
         path.close()
 
-        NSColor.black.setFill()
-        path.fill()
+        let gradient = NSGradient(colors: [
+            NSColor(calibratedRed: 0.76, green: 0.42, blue: 1.0, alpha: 1.0),
+            NSColor(calibratedRed: 0.50, green: 0.0, blue: 1.0, alpha: 1.0)
+        ])
+
+        gradient?.draw(in: path, angle: -45)
 
         image.unlockFocus()
         return image

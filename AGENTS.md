@@ -5,7 +5,7 @@
 
 ## Overview
 
-macOS menu bar companion app. Lives entirely in the macOS status bar (no dock icon, no main window). Clicking the menu bar icon opens a custom floating panel with companion voice controls. Uses push-to-talk (ctrl+option) to capture voice input, transcribes it via AssemblyAI streaming, and sends the transcript + a screenshot of the user's screen to Claude. Claude responds with text (streamed via SSE) and voice (ElevenLabs TTS). A blue cursor overlay can fly to and point at UI elements Claude references on any connected monitor.
+macOS menu bar companion app. Lives entirely in the macOS status bar (no dock icon, no main window). Clicking the menu bar icon opens a custom floating panel with companion voice controls. Uses push-to-talk (ctrl+option) to capture voice input, transcribes it via AssemblyAI streaming, and sends the transcript + a screenshot of the user's screen to Claude. Claude responds with text (streamed via SSE) and voice (ElevenLabs TTS). When the user asks for it, Clicky can also generate a markdown transcript file with ASCII-friendly layout descriptions and expose a tiny cursor-adjacent status chip that advertises `control + option + c` for copying it. A blue cursor overlay can fly to and point at UI elements Claude references on any connected monitor.
 
 All API keys live on a Cloudflare Worker proxy — nothing sensitive ships in the app.
 
@@ -17,6 +17,11 @@ All API keys live on a Cloudflare Worker proxy — nothing sensitive ships in th
 - **AI Chat**: Claude (Sonnet 4.6 default, Opus 4.6 optional) via Cloudflare Worker proxy with SSE streaming
 - **Speech-to-Text**: AssemblyAI real-time streaming (`u3-rt-pro` model) via websocket, with OpenAI and Apple Speech as fallbacks
 - **Text-to-Speech**: ElevenLabs (`eleven_flash_v2_5` model) via Cloudflare Worker proxy
+- **Markdown Export**: Claude-generated `.md` transcript saved to `~/Downloads/Clicky Transcripts`, with objective text extraction and optional ASCII diagram blocks
+- **Workspace Inventory**: User-approved coding workspaces saved in `~/Library/Application Support/Flowee/workspaces.json`, editable from the menu bar panel, and used as the deterministic allowlist for agent delegation. Each workspace also remembers its last-used local agent runtime
+- **Agent Delegation**: Flowee routes a request into `reply`, `draft`, or `delegate` using a cheap Anthropic Haiku classifier call over the captured transcript + screenshot context. Delegate requests pause for explicit workspace selection from the allowed inventory, then launch a local coding-agent runtime chosen from a deterministic registry of supported CLIs
+- **Delegation Runtime Registry**: Flowee maintains a curated local registry of supported coding-agent CLIs and only presents installed runtimes it can resolve deterministically from known binary names and install paths (`codex`, `claude`, `opencode`)
+- **Delegation Log Sidebar**: Delegated agent runs stream their live CLI output into a right-edge floating sidebar, tailed from log files in `~/Library/Application Support/Flowee/Delegation Logs`
 - **Screen Capture**: ScreenCaptureKit (macOS 14.2+), multi-monitor support
 - **Voice Input**: Push-to-talk via `AVAudioEngine` + pluggable transcription-provider layer. System-wide keyboard shortcut via listen-only CGEvent tap.
 - **Element Pointing**: Claude embeds `[POINT:x,y:label:screenN]` tags in responses. The overlay parses these, maps coordinates to the correct monitor, and animates the blue cursor along a bezier arc to the target.
@@ -35,6 +40,7 @@ The app never calls external APIs directly. All requests go through a Cloudflare
 
 Worker secrets: `ANTHROPIC_API_KEY`, `ASSEMBLYAI_API_KEY`, `ELEVENLABS_API_KEY`
 Worker vars: `ELEVENLABS_VOICE_ID`
+App runtime config: `ClickyWorkerBaseURL`, `OnboardingVideoURL` in `leanring-buddy/Info.plist`
 
 ### Key Architecture Decisions
 
@@ -48,16 +54,24 @@ Worker vars: `ELEVENLABS_VOICE_ID`
 
 **Transient Cursor Mode**: When "Show Clicky" is off, pressing the hotkey fades in the cursor overlay for the duration of the interaction (recording → response → TTS → optional pointing), then fades it out automatically after 1 second of inactivity.
 
+**Markdown Transcript Card**: Markdown export requests reuse the same screenshot capture as the spoken response, but run through a separate Claude prompt optimized for objective, diagrammatic markdown. The result is saved to `~/Downloads/Clicky Transcripts` and surfaced through a tiny click-through status chip that follows the cursor, then waits for `control + option + c` to copy the markdown to the clipboard.
+
 ## Key Files
 
 | File | Lines | Purpose |
 |------|-------|---------|
 | `leanring_buddyApp.swift` | ~89 | Menu bar app entry point. Uses `@NSApplicationDelegateAdaptor` with `CompanionAppDelegate` which creates `MenuBarPanelManager` and starts `CompanionManager`. No main window — the app lives entirely in the status bar. |
-| `CompanionManager.swift` | ~1026 | Central state machine. Owns dictation, shortcut monitoring, screen capture, Claude API, ElevenLabs TTS, and overlay management. Tracks voice state (idle/listening/processing/responding), conversation history, model selection, and cursor visibility. Coordinates the full push-to-talk → screenshot → Claude → TTS → pointing pipeline. |
+| `CompanionManager.swift` | ~1530 | Central state machine. Owns dictation, shortcut monitoring, screen capture, Claude API, ElevenLabs TTS, markdown transcript generation, and overlay management. Tracks voice state (idle/listening/processing/responding), conversation history, model selection, cursor visibility, and the current reply/draft/delegate routing state. It also uses a Haiku classifier for intent routing and coordinates runtime-aware delegation into supported local coding agents. |
+| `ClickyActionRouting.swift` | ~20 | Typed action-intent models for the reply/draft/delegate router, plus the pending delegation request payload that the picker and launcher flows will consume. |
 | `MenuBarPanelManager.swift` | ~243 | NSStatusItem + custom NSPanel lifecycle. Creates the menu bar icon, manages the floating companion panel (show/hide/position), installs click-outside-to-dismiss monitor. |
-| `CompanionPanelView.swift` | ~761 | SwiftUI panel content for the menu bar dropdown. Shows companion status, push-to-talk instructions, model picker (Sonnet/Opus), permissions UI, DM feedback button, and quit button. Dark aesthetic using `DS` design system. |
+| `CompanionPanelView.swift` | ~1240 | SwiftUI panel content for the menu bar dropdown. Shows companion status, push-to-talk instructions, model picker (Sonnet/Opus), permissions UI, workspace inventory editor, DM feedback button, and quit button. Dark aesthetic using `DS` design system. |
 | `OverlayWindow.swift` | ~881 | Full-screen transparent overlay hosting the blue cursor, response text, waveform, and spinner. Handles cursor animation, element pointing with bezier arcs, multi-monitor coordinate mapping, and fade-out transitions. |
-| `CompanionResponseOverlay.swift` | ~217 | SwiftUI view for the response text bubble and waveform displayed next to the cursor in the overlay. |
+| `CompanionResponseOverlay.swift` | ~190 | Minimal cursor-adjacent status chip for markdown transcript exports. Shows generating / ready / copied states and tells the user when `control + option + c` is available. |
+| `DelegationAgentRuntimeRegistry.swift` | ~110 | Deterministic registry of supported local coding-agent CLIs. Detects installed runtimes like Codex, Claude Code, and OpenCode from known binary paths and publishes the installed set to the delegation flow. |
+| `DelegationRepoPickerOverlay.swift` | ~420 | Interactive cursor-adjacent workspace and agent picker used when Flowee routes a request into agent delegation. Supports cursor following, arrow-key navigation, return to confirm, escape to cancel, and mouse selection. |
+| `DelegationLogSidebar.swift` | ~470 | Right-edge floating log viewer for delegated agent runs. Streams appended CLI output into a cinematic monospace sidebar while the local coding agent works, then suggests raising a PR when the process exits. |
+| `CodexExecLauncher.swift` | ~430 | Shared launcher service for Flowee's supported local coding-agent CLIs. Creates a fresh branch, launches the selected runtime in the chosen workspace, writes logs to disk, and returns branch + PR context for the delegation sidebar. |
+| `WorkspaceInventoryStore.swift` | ~235 | Persistent allowlist for code workspaces Flowee may delegate into. Loads and saves `workspaces.json` in Application Support, validates repo-like folders, and remembers the last-used local agent runtime per workspace. |
 | `CompanionScreenCaptureUtility.swift` | ~132 | Multi-monitor screenshot capture using ScreenCaptureKit. Returns labeled image data for each connected display. |
 | `BuddyDictationManager.swift` | ~866 | Push-to-talk voice pipeline. Handles microphone capture via `AVAudioEngine`, provider-aware permission checks, keyboard/button dictation sessions, transcript finalization, shortcut parsing, contextual keyterms, and live audio-level reporting for waveform feedback. |
 | `BuddyTranscriptionProvider.swift` | ~100 | Protocol surface and provider factory for voice transcription backends. Resolves provider based on `VoiceTranscriptionProvider` in Info.plist — AssemblyAI, OpenAI, or Apple Speech. |
@@ -84,11 +98,19 @@ open leanring-buddy.xcodeproj
 
 # Select the leanring-buddy scheme, set signing team, Cmd+R to build and run
 
+# Build an installable launcher app for everyday use
+./scripts/build-launcher.sh
+
+# Or build and install directly into /Applications
+./scripts/build-launcher.sh --install
+
 # Known non-blocking warnings: Swift 6 concurrency warnings,
 # deprecated onChange warning in OverlayWindow.swift. Do NOT attempt to fix these.
 ```
 
-**Do NOT run `xcodebuild` from the terminal** — it invalidates TCC (Transparency, Consent, and Control) permissions and the app will need to re-request screen recording, accessibility, etc.
+**Do NOT run ad hoc `xcodebuild` commands from the terminal for normal development** — that invalidates TCC (Transparency, Consent, and Control) permissions and the app will need to re-request screen recording, accessibility, etc.
+
+If you need an installable standalone build, use `./scripts/build-launcher.sh` instead of inventing a separate terminal build flow.
 
 ## Cloudflare Worker
 
@@ -107,6 +129,9 @@ npx wrangler deploy
 # Local dev (create worker/.dev.vars with your keys)
 npx wrangler dev
 ```
+
+Set `ClickyWorkerBaseURL` in `leanring-buddy/Info.plist` to your deployed Worker URL. For local Worker development, temporarily point that value to `http://localhost:8787`.
+Set `OnboardingVideoURL` in `leanring-buddy/Info.plist` to an HLS video URL when you want the onboarding video + timed demo to run. Leave it empty or remove the key to skip the video/demo and go straight to the onboarding voice prompt.
 
 ## Code Style & Conventions
 

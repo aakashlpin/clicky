@@ -7,6 +7,7 @@
 //  opens a floating panel with companion voice controls.
 //
 
+import AppKit
 import ServiceManagement
 import SwiftUI
 import Sparkle
@@ -36,6 +37,9 @@ final class CompanionAppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         print("🎯 Clicky: Starting...")
         print("🎯 Clicky: Version \(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "unknown")")
+        print("🎯 Clicky: PID \(ProcessInfo.processInfo.processIdentifier)")
+
+        terminateOtherRunningInstancesIfNeeded()
 
         UserDefaults.standard.register(defaults: ["NSInitialToolTipDelay": 0])
 
@@ -84,6 +88,22 @@ final class CompanionAppDelegate: NSObject, NSApplicationDelegate {
             try updaterController.updater.start()
         } catch {
             print("⚠️ Clicky: Sparkle updater failed to start: \(error)")
+        }
+    }
+
+    private func terminateOtherRunningInstancesIfNeeded() {
+        guard let bundleIdentifier = Bundle.main.bundleIdentifier else { return }
+
+        let currentProcessIdentifier = ProcessInfo.processInfo.processIdentifier
+        let otherRunningInstances = NSRunningApplication
+            .runningApplications(withBundleIdentifier: bundleIdentifier)
+            .filter { $0.processIdentifier != currentProcessIdentifier }
+
+        guard !otherRunningInstances.isEmpty else { return }
+
+        for runningInstance in otherRunningInstances {
+            print("🎯 Clicky: Terminating duplicate instance PID \(runningInstance.processIdentifier)")
+            runningInstance.terminate()
         }
     }
 }

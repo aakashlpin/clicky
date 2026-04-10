@@ -106,3 +106,36 @@ enum BuddyWAVFileBuilder {
         return Data(bytes: &littleEndianValue, count: MemoryLayout<T>.size)
     }
 }
+
+extension AVAudioPCMBuffer {
+    func deepCopy() -> AVAudioPCMBuffer? {
+        guard let copiedAudioBuffer = AVAudioPCMBuffer(
+            pcmFormat: format,
+            frameCapacity: frameLength
+        ) else {
+            return nil
+        }
+
+        copiedAudioBuffer.frameLength = frameLength
+
+        let sourceAudioBufferList = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: audioBufferList))
+        let destinationAudioBufferList = UnsafeMutableAudioBufferListPointer(copiedAudioBuffer.mutableAudioBufferList)
+
+        guard sourceAudioBufferList.count == destinationAudioBufferList.count else {
+            return nil
+        }
+
+        for bufferIndex in 0..<sourceAudioBufferList.count {
+            guard let sourceDataPointer = sourceAudioBufferList[bufferIndex].mData,
+                  let destinationDataPointer = destinationAudioBufferList[bufferIndex].mData else {
+                return nil
+            }
+
+            let byteCount = Int(sourceAudioBufferList[bufferIndex].mDataByteSize)
+            destinationAudioBufferList[bufferIndex].mDataByteSize = sourceAudioBufferList[bufferIndex].mDataByteSize
+            memcpy(destinationDataPointer, sourceDataPointer, byteCount)
+        }
+
+        return copiedAudioBuffer
+    }
+}

@@ -17,9 +17,16 @@ struct AssemblyAIStreamingTranscriptionProviderError: LocalizedError {
 }
 
 final class AssemblyAIStreamingTranscriptionProvider: BuddyTranscriptionProvider {
+    private static let temporaryTokenRefreshLeadTimeSeconds: TimeInterval = 60
+
     /// URL for the Cloudflare Worker endpoint that returns a short-lived
     /// AssemblyAI streaming token. The real API key never leaves the server.
-    private static let tokenProxyURL = "https://your-worker-name.your-subdomain.workers.dev/transcribe-token"
+    private static let tokenProxyURL: String = {
+        let workerBaseURL =
+            AppBundleConfiguration.stringValue(forKey: "ClickyWorkerBaseURL") ??
+            "https://your-worker-name.your-subdomain.workers.dev"
+        return "\(workerBaseURL)/transcribe-token"
+    }()
 
     let displayName = "AssemblyAI"
     let requiresSpeechRecognitionPermission = false
@@ -32,6 +39,16 @@ final class AssemblyAIStreamingTranscriptionProvider: BuddyTranscriptionProvider
     /// connection pool and causes "Socket is not connected" errors after
     /// a few rapid reconnections to the same host.
     private let sharedWebSocketURLSession = URLSession(configuration: .default)
+    private var cachedTemporaryToken: String?
+    private var cachedTemporaryTokenExpirationDate: Date?
+
+    func prewarmIfNeeded() async {
+        do {
+            _ = try await fetchTemporaryTokenIfNeeded()
+        } catch {
+            print("🎙️ AssemblyAI: token prewarm failed: \(error.localizedDescription)")
+        }
+    }
 
     func startStreamingSession(
         keyterms: [String],
@@ -39,9 +56,7 @@ final class AssemblyAIStreamingTranscriptionProvider: BuddyTranscriptionProvider
         onFinalTranscriptReady: @escaping (String) -> Void,
         onError: @escaping (Error) -> Void
     ) async throws -> any BuddyStreamingTranscriptionSession {
-        // Fetch a fresh temporary token from the proxy before each session
-        let temporaryToken = try await fetchTemporaryToken()
-        print("🎙️ AssemblyAI: fetched temporary token (\(temporaryToken.prefix(20))...)")
+        let temporaryToken = try await fetchTemporaryTokenIfNeeded()
 
         let session = AssemblyAIStreamingTranscriptionSession(
             apiKey: nil,
@@ -57,8 +72,23 @@ final class AssemblyAIStreamingTranscriptionProvider: BuddyTranscriptionProvider
         return session
     }
 
+    private func fetchTemporaryTokenIfNeeded() async throws -> String {
+        if let cachedTemporaryToken,
+           let cachedTemporaryTokenExpirationDate,
+           cachedTemporaryTokenExpirationDate.timeIntervalSinceNow > Self.temporaryTokenRefreshLeadTimeSeconds {
+            print("🎙️ AssemblyAI: using cached temporary token")
+            return cachedTemporaryToken
+        }
+
+        let tokenResponse = try await fetchTemporaryToken()
+        cachedTemporaryToken = tokenResponse.token
+        cachedTemporaryTokenExpirationDate = tokenResponse.expirationDate
+        print("🎙️ AssemblyAI: fetched temporary token (\(tokenResponse.token.prefix(20))...), expires at \(tokenResponse.expirationDate)")
+        return tokenResponse.token
+    }
+
     /// Calls the Cloudflare Worker to get a short-lived AssemblyAI token.
-    private func fetchTemporaryToken() async throws -> String {
+    private func fetchTemporaryToken() async throws -> (token: String, expirationDate: Date) {
         var request = URLRequest(url: URL(string: Self.tokenProxyURL)!)
         request.httpMethod = "POST"
 
@@ -74,13 +104,17 @@ final class AssemblyAIStreamingTranscriptionProvider: BuddyTranscriptionProvider
         }
 
         guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let token = json["token"] as? String else {
+              let token = json["token"] as? String,
+              let expiresInSeconds = json["expires_in_seconds"] as? TimeInterval else {
             throw AssemblyAIStreamingTranscriptionProviderError(
                 message: "Invalid token response from proxy."
             )
         }
 
-        return token
+        return (
+            token: token,
+            expirationDate: Date().addingTimeInterval(expiresInSeconds)
+        )
     }
 }
 
@@ -244,6 +278,7 @@ private final class AssemblyAIStreamingTranscriptionSession: NSObject, BuddyStre
 
         do {
             let envelope = try JSONDecoder().decode(MessageEnvelope.self, from: messageData)
+            print("[AssemblyAI] 📨 Event: \(envelope.type)")
 
             switch envelope.type.lowercased() {
             case "begin":
@@ -254,8 +289,13 @@ private final class AssemblyAIStreamingTranscriptionSession: NSObject, BuddyStre
             case "termination":
                 resolveReadyContinuationIfNeeded(with: .success(()))
                 stateQueue.async {
+                    let bestAvailableTranscriptText = self.bestAvailableTranscriptText()
                     if self.isAwaitingExplicitFinalTranscript && !self.hasDeliveredFinalTranscript {
-                        self.deliverFinalTranscriptIfNeeded(self.bestAvailableTranscriptText())
+                        if bestAvailableTranscriptText.isEmpty {
+                            print("[AssemblyAI] 🕒 Termination arrived with no transcript yet, waiting for fallback deadline")
+                            return
+                        }
+                        self.deliverFinalTranscriptIfNeeded(bestAvailableTranscriptText)
                     }
                 }
             case "error":
@@ -273,6 +313,9 @@ private final class AssemblyAIStreamingTranscriptionSession: NSObject, BuddyStre
     private func handleTurnMessage(_ turnMessage: TurnMessage) {
         let transcriptText = turnMessage.transcript?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        print(
+            "[AssemblyAI] 🗣️ Turn event — chars: \(transcriptText.count), end_of_turn: \(turnMessage.end_of_turn == true), formatted: \(turnMessage.turn_is_formatted == true)"
+        )
 
         stateQueue.async {
             let turnOrder = turnMessage.turn_order
@@ -302,6 +345,10 @@ private final class AssemblyAIStreamingTranscriptionSession: NSObject, BuddyStre
             guard self.isAwaitingExplicitFinalTranscript else { return }
 
             if turnMessage.end_of_turn == true || turnMessage.turn_is_formatted == true {
+                guard !self.bestAvailableTranscriptText().isEmpty else {
+                    print("[AssemblyAI] 🕒 Final turn arrived empty, waiting for fallback deadline")
+                    return
+                }
                 self.explicitFinalTranscriptDeadlineWorkItem?.cancel()
                 self.explicitFinalTranscriptDeadlineWorkItem = nil
                 self.deliverFinalTranscriptIfNeeded(self.bestAvailableTranscriptText())
@@ -352,7 +399,12 @@ private final class AssemblyAIStreamingTranscriptionSession: NSObject, BuddyStre
         let deadlineWorkItem = DispatchWorkItem { [weak self] in
             self?.stateQueue.async {
                 guard let self else { return }
-                self.deliverFinalTranscriptIfNeeded(self.bestAvailableTranscriptText())
+                let bestAvailableTranscriptText = self.bestAvailableTranscriptText()
+                if bestAvailableTranscriptText.isEmpty {
+                    print("[AssemblyAI] 🕒 Final transcript deadline reached with no transcript")
+                    return
+                }
+                self.deliverFinalTranscriptIfNeeded(bestAvailableTranscriptText)
             }
         }
 

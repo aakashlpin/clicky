@@ -1,44 +1,52 @@
 # Release Scripts
 
-## `release.sh` — Ship a new version of makesomething
+## `build-launcher.sh` — Build the installable Clicky launcher
 
-Automates the full release pipeline: build → sign → DMG → notarize → Sparkle appcast → GitHub Release.
+This is the day-to-day release flow if you want to keep using Clicky without running it from Xcode.
+
+It creates a Release archive, stages a standalone `Clicky.app`, and packages a zip artifact. The launcher app ends up at:
+
+```bash
+build/local-release/launcher/Clicky.app
+```
 
 ### Quick start
 
 ```bash
-# Auto-bumps version and build number from the latest GitHub Release
-./scripts/release.sh
+./scripts/build-launcher.sh
 ```
 
-The script checks GitHub for the latest release (e.g. `v1.5`, build 6) and automatically bumps to `v1.6`, build 7. You'll see a confirmation prompt before anything runs.
+Then move `build/local-release/launcher/Clicky.app` into `/Applications` and launch it from there.
 
-### Override version or build
+That `/Applications/Clicky.app` bundle is the launcher you can keep running independently of Xcode. Installing from `/Applications` also matches how the app registers itself as a login item.
+
+### Install automatically
 
 ```bash
-# Set a specific marketing version (auto-bumps build)
-./scripts/release.sh 2.0
-
-# Set both marketing version and build number
-./scripts/release.sh 2.0 10
+./scripts/build-launcher.sh --install
 ```
 
-### Safety
-
-- **Duplicate detection**: If the tag already exists on GitHub, the script exits with an error and suggests what to do.
-- **Confirmation prompt**: Shows the version, build, and previous release before proceeding. Press `y` to continue.
+That replaces `/Applications/Clicky.app` directly.
 
 ### What it does
 
-1. Fetches the latest release from GitHub to determine version + build
-2. Archives the app via `xcodebuild`
-3. Exports a signed `.app` with Developer ID
-4. Creates a DMG with the drag-to-Applications background
-5. Notarizes the DMG with Apple (Gatekeeper compliance)
-6. Signs the DMG with the Sparkle EdDSA key
-7. Generates `appcast.xml` for Sparkle auto-updates
-8. Creates a GitHub Release with the DMG attached
-9. Pushes the updated `appcast.xml` to the releases repo
+1. Archives the app in `Release`
+2. Copies `Clicky.app` out of the archive into `build/local-release/launcher/`
+3. Creates `build/local-release/Clicky.zip`
+4. Verifies the staged app signature
+5. Optionally installs the app into `/Applications`
+
+## `release.sh` — Full distribution release
+
+This is the heavier distribution pipeline for shipping a public release: archive → export → DMG → notarize → Sparkle appcast → GitHub Release.
+
+Use this only when you are publishing a new externally downloadable version, not for normal local use.
+
+### Quick start
+
+```bash
+GITHUB_REPO=your-org/clicky-releases ./scripts/release.sh
+```
 
 ### One-time setup (prerequisites)
 
@@ -57,6 +65,5 @@ The script checks GitHub for the latest release (e.g. `v1.5`, build 6) and autom
        --apple-id YOUR_APPLE_ID \
        --team-id YOUR_TEAM_ID
    ```
-   You'll be prompted for an app-specific password (generate one at [appleid.apple.com](https://appleid.apple.com)).
-5. **Sparkle EdDSA key** — already generated and stored in Keychain (done during initial Sparkle setup)
-6. **Build the project in Xcode at least once** so SPM downloads Sparkle and the Sparkle CLI tools are available
+5. **Sparkle EdDSA key** in Keychain
+6. **Build the project in Xcode at least once** so SPM downloads Sparkle and its CLI tools

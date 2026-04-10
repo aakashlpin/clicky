@@ -63,30 +63,31 @@ enum DS {
         /// White on #1d4ed8 hover achieves ~6.5:1 — also WCAG AA compliant.
         static let textOnAccent: Color = .white
 
-        // ── Tailwind Blue Scale ─────────────────────────────────────
-        // Full Tailwind CSS v4 blue palette for consistent blue usage.
+        // ── Headout Purple Scale ────────────────────────────────────
+        // Kept under the existing "blue" token names so the rest of the
+        // codebase can inherit the new brand theme without a large rename.
         //
         // Usage guide:
         //   50–100  → Very subtle tinted backgrounds (selected rows, hover fills on dark surfaces)
         //   200–300 → Light text/icons on dark backgrounds, disabled states
-        //   400     → Bright accent text, links, icons, chat user bubbles
+        //   400     → Bright accent text, links, icons, status dots
         //   500     → Mid-tone fills, badges, secondary buttons
         //   600     → Primary action fills (buttons, toggles) — main accent
         //   700     → Hover/pressed state for primary actions
         //   800–900 → Deep backgrounds, dark overlays, header bars
-        //   950     → Deepest blue — near-black tinted backgrounds
+        //   950     → Deepest purple-black tinted backgrounds
 
-        static let blue50  = Color(hex: "#eff6ff")
-        static let blue100 = Color(hex: "#dbeafe")
-        static let blue200 = Color(hex: "#bfdbfe")
-        static let blue300 = Color(hex: "#93c5fd")
-        static let blue400 = Color(hex: "#60a5fa")
-        static let blue500 = Color(hex: "#3b82f6")
-        static let blue600 = Color(hex: "#2563eb")
-        static let blue700 = Color(hex: "#1d4ed8")
-        static let blue800 = Color(hex: "#1e40af")
-        static let blue900 = Color(hex: "#1e3a8a")
-        static let blue950 = Color(hex: "#172554")
+        static let blue50  = Color(hex: "#f5efff")
+        static let blue100 = Color(hex: "#eadcff")
+        static let blue200 = Color(hex: "#d6b8ff")
+        static let blue300 = Color(hex: "#bf8fff")
+        static let blue400 = Color(hex: "#a65cff")
+        static let blue500 = Color(hex: "#9333ff")
+        static let blue600 = Color(hex: "#8000ff")
+        static let blue700 = Color(hex: "#6900d4")
+        static let blue800 = Color(hex: "#5200aa")
+        static let blue900 = Color(hex: "#3c007b")
+        static let blue950 = Color(hex: "#240046")
 
         // ── Accent (derived from blue scale) ───────────────────────
         // The primary fill is Blue 600; hover darkens to Blue 700.
@@ -106,6 +107,15 @@ enum DS {
         /// Very subtle accent tint — used for selected item backgrounds (e.g. current step
         /// in the sidebar). Low opacity so it doesn't overpower.
         static let accentSubtle = blue500.opacity(0.10)
+
+        /// Gradient start used for branded pointer surfaces and icon fills.
+        static let brandGradientStart = Color(hex: "#C26BFF")
+
+        /// Gradient end used for branded pointer surfaces and icon fills.
+        static let brandGradientEnd = Color(hex: "#8000FF")
+
+        /// Accent highlight used for brighter branded glows.
+        static let brandGlow = Color(hex: "#E08CFF")
 
         // ── Semantic Colors ──────────────────────────────────────────
 
@@ -141,7 +151,7 @@ enum DS {
         /// The blue cursor/bubble color used in OverlayWindow.
         /// Kept distinct from the accent since it serves a different purpose
         /// (screen overlay vs in-app UI).
-        static let overlayCursorBlue = Color(hex: "#3380FF")
+        static let overlayCursorBlue = Color(hex: "#A65CFF")
 
         // ── Floating Button Gradient ─────────────────────────────────
 

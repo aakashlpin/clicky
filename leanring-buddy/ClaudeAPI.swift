@@ -162,6 +162,7 @@ class ClaudeAPI {
                 userInfo: [NSLocalizedDescriptionKey: "Invalid HTTP response"]
             )
         }
+        print("🌐 Claude streaming response status: \(httpResponse.statusCode)")
 
         // If non-2xx status, read the full body as error text
         guard (200...299).contains(httpResponse.statusCode) else {
@@ -208,6 +209,7 @@ class ClaudeAPI {
         }
 
         let duration = Date().timeIntervalSince(startTime)
+        print("🌐 Claude streaming response complete: \(accumulatedResponseText.count) chars in \(String(format: "%.2f", duration))s")
         return (text: accumulatedResponseText, duration: duration)
     }
 

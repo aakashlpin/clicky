@@ -1,13 +1,17 @@
-# Hi, this is Clicky.
-It's an AI teacher that lives as a buddy next to your cursor. It can see your screen, talk to you, and even point at stuff. Kinda like having a real teacher next to you.
+# Hi, this is Flowee.
+It's a flow-state sidekick that lives next to your cursor. It sees your screen, listens to what you're trying to do, talks back when you need guidance, and can now kick work over to local coding agents when you want execution instead of commentary.
+
+The goal is simple: keep you in flow. You stay on the simulator, the browser, the design, or the bug you just noticed. Flowee handles the context capture, the interpretation, the draft, or the delegation.
 
 Download it [here](https://www.clicky.so/) for free.
 
 Here's the [original tweet](https://x.com/FarzaTV/status/2041314633978659092) that kinda blew up for a demo for more context.
 
-![Clicky — an ai buddy that lives on your mac](clicky-demo.gif)
+![Flowee — a flow-state sidekick that lives on your mac](clicky-demo.gif)
 
-This is the open-source version of Clicky for those that want to hack on it, build their own features, or just see how it works under the hood.
+This is the open-source version of Flowee for people who want to hack on it, extend it, wire in new agent workflows, or just understand how a cursor-native sidekick can work on macOS.
+
+Big thanks to [@farzatv](https://x.com/farzatv) for building Clicky and open-sourcing the foundation this version grows from.
 
 ## Get started with Claude Code
 
@@ -20,12 +24,12 @@ Hi Claude.
 
 Clone https://github.com/farzaa/clicky.git into my current directory.
 
-Then read the CLAUDE.md. I want to get Clicky running locally on my Mac.
+Then read the CLAUDE.md. I want to get Flowee running locally on my Mac.
 
 Help me set up everything — the Cloudflare Worker with my own API keys, the proxy URLs, and getting it building in Xcode. Walk me through it.
 ```
 
-That's it. It'll clone the repo, read the docs, and walk you through the whole setup. Once you're running you can just keep talking to it — build features, fix bugs, whatever. Go crazy.
+That's it. It'll clone the repo, read the docs, and walk you through the whole setup. Once you're running, you can keep iterating in place: ask Flowee to explain what you're seeing, draft something from the current screen, or delegate a coding task into a local agent without breaking flow.
 
 ## Manual setup
 
@@ -89,19 +93,18 @@ ELEVENLABS_API_KEY=...
 ELEVENLABS_VOICE_ID=...
 ```
 
-Then update the proxy URLs in the Swift code to point to `http://localhost:8787` instead of the deployed Worker URL while developing. Grep for `clicky-proxy` to find them all.
+Then update `ClickyWorkerBaseURL` in `leanring-buddy/Info.plist` to `http://localhost:8787` while developing.
 
-### 3. Update the proxy URLs in the app
+### 3. Update the proxy URL in the app
 
-The app has the Worker URL hardcoded in a few places. Search for `your-worker-name.your-subdomain.workers.dev` and replace it with your Worker URL:
+The app reads the Worker base URL from `leanring-buddy/Info.plist`. Set `ClickyWorkerBaseURL` to your deployed Worker URL:
 
-```bash
-grep -r "clicky-proxy" leanring-buddy/
+```xml
+<key>ClickyWorkerBaseURL</key>
+<string>https://your-worker-name.your-subdomain.workers.dev</string>
 ```
 
-You'll find it in:
-- `CompanionManager.swift` — Claude chat + ElevenLabs TTS
-- `AssemblyAIStreamingTranscriptionProvider.swift` — AssemblyAI token endpoint
+For local Worker development, temporarily point that same value to `http://localhost:8787`.
 
 ### 4. Open in Xcode and run
 
@@ -116,6 +119,28 @@ In Xcode:
 
 The app will appear in your menu bar (not the dock). Click the icon to open the panel, grant the permissions it asks for, and you're good.
 
+### 5. Build a standalone launcher for everyday use
+
+Running from Xcode is fine for development, but the app should be installed from a Release build if you want to keep using it normally without Xcode open.
+
+```bash
+./scripts/build-launcher.sh
+```
+
+That produces:
+
+```bash
+build/local-release/launcher/Flowee.app
+```
+
+Move that `Flowee.app` into `/Applications` and launch it from there. That app bundle is the launcher, and installing it in `/Applications` is the setup that works properly with the app's login-item registration.
+
+If you want the script to install it for you:
+
+```bash
+./scripts/build-launcher.sh --install
+```
+
 ### Permissions the app needs
 
 - **Microphone** — for push-to-talk voice capture
@@ -127,7 +152,7 @@ The app will appear in your menu bar (not the dock). Click the icon to open the 
 
 If you want the full technical breakdown, read `CLAUDE.md`. But here's the short version:
 
-**Menu bar app** (no dock icon) with two `NSPanel` windows — one for the control panel dropdown, one for the full-screen transparent cursor overlay. Push-to-talk streams audio over a websocket to AssemblyAI, sends the transcript + screenshot to Claude via streaming SSE, and plays the response through ElevenLabs TTS. Claude can embed `[POINT:x,y:label:screenN]` tags in its responses to make the cursor fly to specific UI elements across multiple monitors. All three APIs are proxied through a Cloudflare Worker.
+**Menu bar app** (no dock icon) with AppKit-backed floating surfaces for the control panel, cursor-adjacent overlays, and delegation logs. Push-to-talk streams audio over a websocket to AssemblyAI, sends transcript + screenshot context to Claude, and plays spoken replies through ElevenLabs TTS. Flowee can route requests into `reply`, `draft`, or `delegate`, and when delegation is selected it can hand work to local coding-agent CLIs in approved workspaces. Claude can also embed `[POINT:x,y:label:screenN]` tags in responses to make the cursor fly to specific UI elements across multiple monitors. All API traffic is proxied through a Cloudflare Worker.
 
 ## Project structure
 
@@ -147,6 +172,6 @@ CLAUDE.md                # Full architecture doc (agents read this)
 
 ## Contributing
 
-PRs welcome. If you're using Claude Code, it already knows the codebase — just tell it what you want to build and point it at `CLAUDE.md`.
+PRs welcome. If you're using Claude Code, it already knows the codebase. Tell it what part of the flow-state sidekick you want to change and point it at `CLAUDE.md`.
 
 Got feedback? DM me on X [@farzatv](https://x.com/farzatv).

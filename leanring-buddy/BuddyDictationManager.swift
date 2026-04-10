@@ -220,6 +220,7 @@ final class BuddyDictationManager: NSObject, ObservableObject {
     private static let recordedAudioPowerHistoryLength = 44
     private static let recordedAudioPowerHistoryBaselineLevel: CGFloat = 0.02
     private static let recordedAudioPowerHistorySampleIntervalSeconds: TimeInterval = 0.07
+    private static let startupAudioPrebufferDurationSeconds: Double = 1.5
 
     @Published private(set) var isRecordingFromMicrophoneButton = false
     @Published private(set) var isRecordingFromKeyboardShortcut = false
@@ -264,6 +265,7 @@ final class BuddyDictationManager: NSObject, ObservableObject {
 
     private let transcriptionProvider: any BuddyTranscriptionProvider
     private let audioEngine = AVAudioEngine()
+    private let prebufferStateQueue = DispatchQueue(label: "com.learningbuddy.dictation.prebuffer")
     private var activeTranscriptionSession: (any BuddyStreamingTranscriptionSession)?
     private var activeStartSource: BuddyDictationStartSource?
     private var draftCallbacks: BuddyDictationDraftCallbacks?
@@ -279,6 +281,8 @@ final class BuddyDictationManager: NSObject, ObservableObject {
     /// Timestamp of the last completed permission request, used to debounce
     /// rapid follow-up requests that arrive before macOS updates its cache.
     private var lastPermissionRequestCompletedAt: Date?
+    private var pendingAudioBuffersBeforeTranscriptionReady: [AVAudioPCMBuffer] = []
+    private var pendingAudioBufferFrameCount = 0
 
     override init() {
         let transcriptionProvider = BuddyTranscriptionProviderFactory.makeDefaultProvider()
@@ -289,6 +293,10 @@ final class BuddyDictationManager: NSObject, ObservableObject {
 
     func updateContextualKeyterms(_ contextualKeyterms: [String]) {
         self.contextualKeyterms = contextualKeyterms
+    }
+
+    func prewarmTranscriptionProviderIfNeeded() async {
+        await transcriptionProvider.prewarmIfNeeded()
     }
 
     func startPersistentDictationFromMicrophoneButton(
@@ -345,6 +353,7 @@ final class BuddyDictationManager: NSObject, ObservableObject {
         audioEngine.stop()
         audioEngine.inputNode.removeTap(onBus: 0)
         activeTranscriptionSession?.cancel()
+        clearPendingAudioBuffers()
 
         resetSessionState()
     }
@@ -454,6 +463,7 @@ final class BuddyDictationManager: NSObject, ObservableObject {
                 audioEngine.stop()
                 audioEngine.inputNode.removeTap(onBus: 0)
                 activeTranscriptionSession?.cancel()
+                clearPendingAudioBuffers()
                 resetSessionState()
                 return
             }
@@ -464,6 +474,21 @@ final class BuddyDictationManager: NSObject, ObservableObject {
             print("🎙️ BuddyDictationManager: recognition session started")
         } catch {
             isPreparingToRecord = false
+
+            if isExpectedStartCancellation(error) {
+                audioEngine.stop()
+                audioEngine.inputNode.removeTap(onBus: 0)
+                activeTranscriptionSession?.cancel()
+                clearPendingAudioBuffers()
+                print("🎙️ BuddyDictationManager: start cancelled while opening \(transcriptionProvider.displayName)")
+                resetSessionState()
+                return
+            }
+
+            audioEngine.stop()
+            audioEngine.inputNode.removeTap(onBus: 0)
+            activeTranscriptionSession?.cancel()
+            clearPendingAudioBuffers()
             lastErrorMessage = userFacingErrorMessage(
                 from: error,
                 fallback: "couldn't start voice input. try again."
@@ -490,6 +515,7 @@ final class BuddyDictationManager: NSObject, ObservableObject {
 
         let finalTranscriptFallbackDelaySeconds = activeTranscriptionSession?.finalTranscriptFallbackDelaySeconds
             ?? Self.defaultFinalTranscriptFallbackDelaySeconds
+        print("🎙️ BuddyDictationManager: waiting for final transcript (fallback in \(String(format: "%.1f", finalTranscriptFallbackDelaySeconds))s)")
 
         audioEngine.stop()
         audioEngine.inputNode.removeTap(onBus: 0)
@@ -515,9 +541,10 @@ final class BuddyDictationManager: NSObject, ObservableObject {
         activeTranscriptionSession?.cancel()
         activeTranscriptionSession = nil
 
-        print("🎙️ BuddyDictationManager: opening transcription provider \(transcriptionProvider.displayName)")
+        try startAudioCapture()
+        print("🎙️ BuddyDictationManager: audio capture started, opening transcription provider \(transcriptionProvider.displayName)")
 
-        let activeTranscriptionSession = try await transcriptionProvider.startStreamingSession(
+        let openedTranscriptionSession = try await transcriptionProvider.startStreamingSession(
             keyterms: buildTranscriptionKeyterms(),
             onTranscriptUpdate: { [weak self] transcriptText in
                 Task { @MainActor in
@@ -528,6 +555,7 @@ final class BuddyDictationManager: NSObject, ObservableObject {
                 Task { @MainActor in
                     guard let self else { return }
                     self.latestRecognizedText = transcriptText
+                    print("🎙️ BuddyDictationManager: final transcript ready (\(transcriptText.count) chars)")
 
                     if self.isFinalizingTranscript {
                         self.finishCurrentDictationSessionIfNeeded(
@@ -543,20 +571,88 @@ final class BuddyDictationManager: NSObject, ObservableObject {
             }
         )
 
-        self.activeTranscriptionSession = activeTranscriptionSession
-        print("🎙️ BuddyDictationManager: provider ready, starting audio engine")
+        self.activeTranscriptionSession = openedTranscriptionSession
+        flushPendingAudioBuffersIntoActiveTranscriptionSession()
+        print("🎙️ BuddyDictationManager: provider ready, flushed startup audio buffer")
+    }
+
+    private func startAudioCapture() throws {
+        clearPendingAudioBuffers()
 
         let inputNode = audioEngine.inputNode
         let inputFormat = inputNode.outputFormat(forBus: 0)
 
         inputNode.removeTap(onBus: 0)
         inputNode.installTap(onBus: 0, bufferSize: 1024, format: inputFormat) { [weak self] buffer, _ in
-            self?.activeTranscriptionSession?.appendAudioBuffer(buffer)
-            self?.updateAudioPowerLevel(from: buffer)
+            self?.handleCapturedAudioBuffer(buffer)
         }
 
         audioEngine.prepare()
         try audioEngine.start()
+    }
+
+    private func handleCapturedAudioBuffer(_ audioBuffer: AVAudioPCMBuffer) {
+        if let activeTranscriptionSession {
+            activeTranscriptionSession.appendAudioBuffer(audioBuffer)
+        } else {
+            enqueueAudioBufferForStartupPrebuffer(audioBuffer)
+        }
+
+        updateAudioPowerLevel(from: audioBuffer)
+    }
+
+    private func enqueueAudioBufferForStartupPrebuffer(_ audioBuffer: AVAudioPCMBuffer) {
+        guard let copiedAudioBuffer = audioBuffer.deepCopy() else { return }
+
+        prebufferStateQueue.async {
+            self.pendingAudioBuffersBeforeTranscriptionReady.append(copiedAudioBuffer)
+            self.pendingAudioBufferFrameCount += Int(copiedAudioBuffer.frameLength)
+
+            let maximumBufferedFrameCount = Int(
+                copiedAudioBuffer.format.sampleRate * Self.startupAudioPrebufferDurationSeconds
+            )
+
+            while self.pendingAudioBufferFrameCount > maximumBufferedFrameCount,
+                  let oldestBufferedAudio = self.pendingAudioBuffersBeforeTranscriptionReady.first {
+                self.pendingAudioBuffersBeforeTranscriptionReady.removeFirst()
+                self.pendingAudioBufferFrameCount -= Int(oldestBufferedAudio.frameLength)
+            }
+        }
+    }
+
+    private func flushPendingAudioBuffersIntoActiveTranscriptionSession() {
+        guard let activeTranscriptionSession else { return }
+
+        let pendingAudioBuffers = prebufferStateQueue.sync { () -> [AVAudioPCMBuffer] in
+            let capturedPendingAudioBuffers = self.pendingAudioBuffersBeforeTranscriptionReady
+            self.pendingAudioBuffersBeforeTranscriptionReady.removeAll()
+            self.pendingAudioBufferFrameCount = 0
+            return capturedPendingAudioBuffers
+        }
+
+        if !pendingAudioBuffers.isEmpty {
+            print("🎙️ BuddyDictationManager: flushing \(pendingAudioBuffers.count) buffered audio chunk(s) into \(transcriptionProvider.displayName)")
+        }
+
+        for pendingAudioBuffer in pendingAudioBuffers {
+            activeTranscriptionSession.appendAudioBuffer(pendingAudioBuffer)
+        }
+    }
+
+    private func clearPendingAudioBuffers() {
+        prebufferStateQueue.sync {
+            pendingAudioBuffersBeforeTranscriptionReady.removeAll()
+            pendingAudioBufferFrameCount = 0
+        }
+    }
+
+    private func isExpectedStartCancellation(_ error: Error) -> Bool {
+        if error is CancellationError {
+            return true
+        }
+
+        let nsError = error as NSError
+        return nsError.domain == NSURLErrorDomain && nsError.code == NSURLErrorCancelled
     }
 
     private func handleRecognitionError(_ error: Error) {
@@ -588,6 +684,7 @@ final class BuddyDictationManager: NSObject, ObservableObject {
         let finalDraftText = composeDraftText(withTranscribedText: latestRecognizedText)
         let finalTranscriptText = latestRecognizedText.trimmingCharacters(in: .whitespacesAndNewlines)
         let currentDraftCallbacks = draftCallbacks
+        print("🎙️ BuddyDictationManager: finishing session, transcript length \(finalTranscriptText.count), submit \(shouldSubmitFinalDraft)")
 
         if !shouldSubmitFinalDraft && !finalDraftText.isEmpty {
             currentDraftCallbacks?.updateDraftText(finalDraftText)
@@ -596,6 +693,7 @@ final class BuddyDictationManager: NSObject, ObservableObject {
         audioEngine.stop()
         audioEngine.inputNode.removeTap(onBus: 0)
         activeTranscriptionSession?.cancel()
+        clearPendingAudioBuffers()
 
         resetSessionState()
 
@@ -629,6 +727,7 @@ final class BuddyDictationManager: NSObject, ObservableObject {
     private func resetSessionState() {
         pendingStartRequestIdentifier = UUID()
         activeTranscriptionSession = nil
+        clearPendingAudioBuffers()
         draftCallbacks = nil
         activeStartSource = nil
         draftTextBeforeCurrentDictation = ""

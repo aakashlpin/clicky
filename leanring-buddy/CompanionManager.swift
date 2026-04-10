@@ -7,6 +7,7 @@
 //  exposes observable voice state for the panel UI.
 //
 
+import AppKit
 import AVFoundation
 import Combine
 import Foundation
@@ -22,7 +23,7 @@ enum CompanionVoiceState {
 }
 
 @MainActor
-final class CompanionManager: ObservableObject {
+final class CompanionManager: NSObject, ObservableObject, NSSpeechSynthesizerDelegate {
     @Published private(set) var voiceState: CompanionVoiceState = .idle
     @Published private(set) var lastTranscript: String?
     @Published private(set) var currentAudioPowerLevel: CGFloat = 0
@@ -61,19 +62,45 @@ final class CompanionManager: ObservableObject {
 
     private var onboardingMusicPlayer: AVAudioPlayer?
     private var onboardingMusicFadeTimer: Timer?
+    private let fallbackSpeechSynthesizer = NSSpeechSynthesizer()
+    private var currentFallbackSpeechIdentifier: UUID?
 
     let buddyDictationManager = BuddyDictationManager()
     let globalPushToTalkShortcutMonitor = GlobalPushToTalkShortcutMonitor()
     let overlayWindowManager = OverlayWindowManager()
-    // Response text is now displayed inline on the cursor overlay via
-    // streamingResponseText, so no separate response overlay manager is needed.
+    let companionResponseOverlayManager = CompanionResponseOverlayManager()
+    let delegationRepoPickerOverlayManager = DelegationRepoPickerOverlayManager()
+    let delegationLogSidebarManager = DelegationLogSidebarManager()
+    let workspaceInventoryStore = WorkspaceInventoryStore()
+    let delegationAgentRuntimeRegistry = DelegationAgentRuntimeRegistry()
+    @Published private(set) var currentActionIntent: ClickyActionIntent = .reply
+    @Published private(set) var isAwaitingDelegationWorkspaceSelection = false
+    @Published private(set) var pendingDelegationRequest: ClickyDelegationRequest?
+    @Published private(set) var selectedDelegationWorkspace: WorkspaceInventoryStore.WorkspaceRecord?
+    @Published private(set) var selectedDelegationRuntimeID: DelegationAgentRuntimeID?
 
     /// Base URL for the Cloudflare Worker proxy. All API requests route
     /// through this so keys never ship in the app binary.
-    private static let workerBaseURL = "https://your-worker-name.your-subdomain.workers.dev"
+    private static let workerBaseURL =
+        AppBundleConfiguration.stringValue(forKey: "ClickyWorkerBaseURL") ??
+        "https://your-worker-name.your-subdomain.workers.dev"
+
+    /// Optional onboarding video source. When missing, onboarding skips the
+    /// video/demo segment and goes straight to the voice prompt.
+    private static var onboardingVideoURL: URL? {
+        guard let onboardingVideoURLString = AppBundleConfiguration.stringValue(forKey: "OnboardingVideoURL") else {
+            return nil
+        }
+
+        return URL(string: onboardingVideoURLString)
+    }
 
     private lazy var claudeAPI: ClaudeAPI = {
         return ClaudeAPI(proxyURL: "\(Self.workerBaseURL)/chat", model: selectedModel)
+    }()
+
+    private lazy var actionIntentClassifierAPI: ClaudeAPI = {
+        return ClaudeAPI(proxyURL: "\(Self.workerBaseURL)/chat", model: "claude-sonnet-4-0")
     }()
 
     private lazy var elevenLabsTTSClient: ElevenLabsTTSClient = {
@@ -84,11 +111,21 @@ final class CompanionManager: ObservableObject {
     /// Each entry is the user's transcript and Claude's response.
     private var conversationHistory: [(userTranscript: String, assistantResponse: String)] = []
 
+    private struct ActionIntentClassificationPayload: Decodable {
+        let intent: ClickyActionIntent
+    }
+
     /// The currently running AI response task, if any. Cancelled when the user
     /// speaks again so a new response can begin immediately.
     private var currentResponseTask: Task<Void, Never>?
+    /// Separate task for markdown transcript generation so it can stream into
+    /// the cursor-adjacent card while the spoken response continues normally.
+    private var currentMarkdownTranscriptTask: Task<Void, Never>?
 
     private var shortcutTransitionCancellable: AnyCancellable?
+    private var stopSpeechPlaybackShortcutCancellable: AnyCancellable?
+    private var markdownTranscriptCopyShortcutCancellable: AnyCancellable?
+    private var pickerNavigationCancellable: AnyCancellable?
     private var voiceStateCancellable: AnyCancellable?
     private var audioPowerCancellable: AnyCancellable?
     private var accessibilityCheckTimer: Timer?
@@ -96,6 +133,9 @@ final class CompanionManager: ObservableObject {
     /// Scheduled hide for transient cursor mode — cancelled if the user
     /// speaks again before the delay elapses.
     private var transientHideTask: Task<Void, Never>?
+    private var latestGeneratedMarkdownTranscriptText: String?
+    private(set) var pendingDelegationScreenCaptures: [CompanionScreenCapture] = []
+    private let delegationAgentLauncher = DelegationAgentLauncher()
 
     /// True when all three required permissions (accessibility, screen recording,
     /// microphone) are granted. Used by the panel to show a single "all good" state.
@@ -173,15 +213,34 @@ final class CompanionManager: ObservableObject {
     }
 
     func start() {
+        fallbackSpeechSynthesizer.delegate = self
+        globalPushToTalkShortcutMonitor.shouldConsumeEscapeKey = { [weak self] in
+            guard let self else { return false }
+            return self.elevenLabsTTSClient.isPlaying || self.fallbackSpeechSynthesizer.isSpeaking
+        }
+        globalPushToTalkShortcutMonitor.shouldConsumeMarkdownTranscriptCopyShortcut = { [weak self] in
+            guard let self else { return false }
+            return self.latestGeneratedMarkdownTranscriptText != nil
+        }
+        globalPushToTalkShortcutMonitor.shouldConsumePickerNavigationInput = { [weak self] in
+            guard let self else { return false }
+            return self.delegationRepoPickerOverlayManager.isVisible
+        }
         refreshAllPermissions()
         print("🔑 Clicky start — accessibility: \(hasAccessibilityPermission), screen: \(hasScreenRecordingPermission), mic: \(hasMicrophonePermission), screenContent: \(hasScreenContentPermission), onboarded: \(hasCompletedOnboarding)")
         startPermissionPolling()
         bindVoiceStateObservation()
         bindAudioPowerLevel()
         bindShortcutTransitions()
+        bindStopSpeechPlaybackShortcut()
+        bindMarkdownTranscriptCopyShortcut()
+        bindPickerNavigationShortcut()
         // Eagerly touch the Claude API so its TLS warmup handshake completes
         // well before the onboarding demo fires at ~40s into the video.
         _ = claudeAPI
+        Task {
+            await buddyDictationManager.prewarmTranscriptionProviderIfNeeded()
+        }
 
         // If the user already completed onboarding AND all permissions are
         // still granted, show the cursor overlay immediately. If permissions
@@ -288,14 +347,25 @@ final class CompanionManager: ObservableObject {
     }
 
     func stop() {
+        globalPushToTalkShortcutMonitor.shouldConsumeEscapeKey = nil
+        globalPushToTalkShortcutMonitor.shouldConsumeMarkdownTranscriptCopyShortcut = nil
+        globalPushToTalkShortcutMonitor.shouldConsumePickerNavigationInput = nil
         globalPushToTalkShortcutMonitor.stop()
         buddyDictationManager.cancelCurrentDictation()
+        companionResponseOverlayManager.hideMarkdownTranscriptOverlay()
+        cancelPendingDelegationFlow()
+        delegationLogSidebarManager.hideStreamingLogSidebar()
         overlayWindowManager.hideOverlay()
         transientHideTask?.cancel()
 
         currentResponseTask?.cancel()
+        currentMarkdownTranscriptTask?.cancel()
         currentResponseTask = nil
+        currentMarkdownTranscriptTask = nil
         shortcutTransitionCancellable?.cancel()
+        stopSpeechPlaybackShortcutCancellable?.cancel()
+        markdownTranscriptCopyShortcutCancellable?.cancel()
+        pickerNavigationCancellable?.cancel()
         voiceStateCancellable?.cancel()
         audioPowerCancellable?.cancel()
         accessibilityCheckTimer?.invalidate()
@@ -470,9 +540,73 @@ final class CompanionManager: ObservableObject {
             }
     }
 
+    private func bindStopSpeechPlaybackShortcut() {
+        stopSpeechPlaybackShortcutCancellable = globalPushToTalkShortcutMonitor
+            .stopSpeechPlaybackPublisher
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] in
+                self?.handleStopSpeechPlaybackShortcut()
+            }
+    }
+
+    private func bindMarkdownTranscriptCopyShortcut() {
+        markdownTranscriptCopyShortcutCancellable = globalPushToTalkShortcutMonitor
+            .markdownTranscriptCopyPublisher
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] in
+                self?.handleMarkdownTranscriptCopyShortcut()
+            }
+    }
+
+    private func bindPickerNavigationShortcut() {
+        pickerNavigationCancellable = globalPushToTalkShortcutMonitor
+            .pickerNavigationPublisher
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] event in
+                self?.handlePickerNavigationEvent(event)
+            }
+    }
+
+    private func handleStopSpeechPlaybackShortcut() {
+        guard elevenLabsTTSClient.isPlaying || fallbackSpeechSynthesizer.isSpeaking else { return }
+        print("🔊 Stop speech shortcut pressed (escape)")
+        stopAllSpeechPlayback()
+        voiceState = .idle
+        scheduleTransientHideIfNeeded()
+    }
+
+    private func handleMarkdownTranscriptCopyShortcut() {
+        guard let latestGeneratedMarkdownTranscriptText else { return }
+        print("📝 Markdown transcript copy shortcut pressed")
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(latestGeneratedMarkdownTranscriptText, forType: .string)
+        self.latestGeneratedMarkdownTranscriptText = nil
+        companionResponseOverlayManager.showCopiedMarkdownTranscriptStatus()
+    }
+
+    private func handlePickerNavigationEvent(_ event: GlobalPushToTalkShortcutMonitor.PickerNavigationEvent) {
+        guard delegationRepoPickerOverlayManager.isVisible else { return }
+
+        switch event {
+        case .moveUp:
+            delegationRepoPickerOverlayManager.moveSelectionUp()
+        case .moveDown:
+            delegationRepoPickerOverlayManager.moveSelectionDown()
+        case .moveLeft:
+            delegationRepoPickerOverlayManager.moveRuntimeLeft()
+        case .moveRight:
+            delegationRepoPickerOverlayManager.moveRuntimeRight()
+        case .confirmSelection:
+            delegationRepoPickerOverlayManager.confirmSelection()
+        case .cancelSelection:
+            delegationRepoPickerOverlayManager.cancelSelection()
+        }
+    }
+
     private func handleShortcutTransition(_ transition: BuddyPushToTalkShortcut.ShortcutTransition) {
         switch transition {
         case .pressed:
+            guard latestGeneratedMarkdownTranscriptText == nil else { return }
             guard !buddyDictationManager.isDictationInProgress else { return }
             // Don't register push-to-talk while the onboarding video is playing
             guard !showOnboardingVideo else { return }
@@ -493,8 +627,13 @@ final class CompanionManager: ObservableObject {
 
             // Cancel any in-progress response and TTS from a previous utterance
             currentResponseTask?.cancel()
-            elevenLabsTTSClient.stopPlayback()
+            currentMarkdownTranscriptTask?.cancel()
+            currentMarkdownTranscriptTask = nil
+            latestGeneratedMarkdownTranscriptText = nil
+            cancelPendingDelegationFlow()
+            stopAllSpeechPlayback()
             clearDetectedElementLocation()
+            companionResponseOverlayManager.hideMarkdownTranscriptOverlay()
 
             // Dismiss the onboarding prompt if it's showing
             if showOnboardingPrompt {
@@ -542,7 +681,7 @@ final class CompanionManager: ObservableObject {
     // MARK: - Companion Prompt
 
     private static let companionVoiceResponseSystemPrompt = """
-    you're clicky, a friendly always-on companion that lives in the user's menu bar. the user just spoke to you via push-to-talk and you can see their screen(s). your reply will be spoken aloud via text-to-speech, so write the way you'd actually talk. this is an ongoing conversation — you remember everything they've said before.
+    you're flowee, a friendly always-on companion that lives in the user's menu bar. the user just spoke to you via push-to-talk and you can see their screen(s). your reply will be spoken aloud via text-to-speech, so write the way you'd actually talk. this is an ongoing conversation — you remember everything they've said before.
 
     rules:
     - default to one or two sentences. be direct and dense. BUT if the user asks you to explain more, go deeper, or elaborate, then go all out — give a thorough, detailed explanation with no length limit.
@@ -576,7 +715,219 @@ final class CompanionManager: ObservableObject {
     - element is on screen 2 (not where cursor is): "that's over on your other monitor — see the terminal window? [POINT:400,300:terminal:screen2]"
     """
 
+    private static let markdownTranscriptRequestKeywords = [
+        "markdown",
+        ".md",
+        "text file",
+        "transcript",
+        "whiteboard",
+        "ascii",
+        "diagram"
+    ]
+
+    private static let companionMarkdownTranscriptSystemPrompt = """
+    you're flowee generating a markdown transcript from screenshot images. the user wants a text file version of what is visible, often for whiteboards, notes, sketches, or diagrams.
+
+    rules:
+    - return markdown only. no preamble, no explanation outside the markdown.
+    - be objective and visual. describe what is actually visible, not what you assume was intended.
+    - preserve uncertainty. if text is unclear, mark it as [unclear] instead of inventing it.
+    - if the layout matters, include a fenced code block that uses plain ascii characters to show the structure diagrammatically.
+    - keep text legible and useful for copying into docs. short sentences, clear headings.
+    - if there are multiple screenshots, prioritize the one labeled "primary focus" and fold in relevant details from the others only when they clearly belong to the same content.
+    - do not mention being an ai model or refer to the request itself.
+
+    preferred structure:
+    # Transcript
+    ## Summary
+    ## Diagram
+    ## Visible Text
+    ## Ambiguities
+
+    for "Diagram", use ascii only inside a fenced code block when spatial relationships matter. if there is no meaningful layout to preserve, say "No strong spatial layout visible."
+    """
+
     // MARK: - AI Response Pipeline
+    private static let actionIntentClassificationSystemPrompt = """
+    you're flowee's intent router.
+
+    classify the user's request into exactly one of:
+    - reply
+    - draft
+    - delegate
+
+    definitions:
+    - reply: the user mainly wants explanation, analysis, brainstorming, guidance, or an answer back.
+    - draft: the user wants a written artifact prepared for them, such as a message, dm, email, summary, or write-up.
+    - delegate: the user wants a coding agent or local code workspace to take action on a real implementation task, bug fix, change, or investigation.
+
+    use both the transcript and the screenshot context.
+
+    routing bias:
+    - prefer delegate when the user's statement is instructive, imperative, or execution-oriented.
+    - if the user is telling flowee to change, fix, build, investigate, implement, clean up, adjust, or make something happen in a real codebase, classify as delegate.
+    - short commands should still be delegate when they are asking flowee to act, even if they are underspecified.
+    - if the transcript reads like an instruction to do work now, classify as delegate.
+    - prefer draft when the user wants communication prepared for someone else.
+    - prefer reply when they mainly want advice, interpretation, brainstorming, or explanation.
+
+    examples:
+    - "fix this spacing issue" -> {"intent":"delegate"}
+    - "do this work" -> {"intent":"delegate"}
+    - "make this change" -> {"intent":"delegate"}
+    - "handle this" -> {"intent":"delegate"}
+    - "work on this" -> {"intent":"delegate"}
+    - "take care of this bug" -> {"intent":"delegate"}
+    - "spin up an agent and handle this" -> {"intent":"delegate"}
+    - "make this match the design on screen" -> {"intent":"delegate"}
+    - "investigate why this is broken and patch it" -> {"intent":"delegate"}
+    - "draft a slack message to varun about this" -> {"intent":"draft"}
+    - "write up what i'm seeing here" -> {"intent":"draft"}
+    - "what is going wrong here?" -> {"intent":"reply"}
+    - "help me think through this architecture" -> {"intent":"reply"}
+
+    return strict json only in this shape:
+    {"intent":"reply|draft|delegate"}
+    """
+
+    private static func shouldGenerateMarkdownTranscript(for transcript: String) -> Bool {
+        let normalizedTranscript = transcript.lowercased()
+        return markdownTranscriptRequestKeywords.contains { normalizedTranscript.contains($0) }
+    }
+
+    private func classifyActionIntent(
+        transcript: String,
+        labeledImages: [(data: Data, label: String)]
+    ) async -> ClickyActionIntent {
+        let classificationPrompt = """
+        classify this request for flowee.
+
+        transcript:
+        \(transcript)
+
+        screenshot context labels:
+        \(labeledImages.map(\.label).joined(separator: " | "))
+        """
+
+        do {
+            let (classificationResponseText, _) = try await actionIntentClassifierAPI.analyzeImage(
+                images: labeledImages,
+                systemPrompt: Self.actionIntentClassificationSystemPrompt,
+                userPrompt: classificationPrompt
+            )
+
+            let resolvedIntent = extractActionIntent(from: classificationResponseText)
+            print("🧭 Intent classifier raw response: \(classificationResponseText)")
+            print("🧭 Intent classifier resolved: \(resolvedIntent.rawValue)")
+            return resolvedIntent
+        } catch {
+            print("⚠️ Intent classifier failed: \(error)")
+            return .reply
+        }
+    }
+
+    private func extractActionIntent(from classificationResponseText: String) -> ClickyActionIntent {
+        let cleanedClassificationResponseText = classificationResponseText.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        if let classificationResponseData = cleanedClassificationResponseText.data(using: .utf8),
+           let classificationPayload = try? JSONDecoder().decode(
+               ActionIntentClassificationPayload.self,
+               from: classificationResponseData
+           ) {
+            return classificationPayload.intent
+        }
+
+        if let jsonObjectStartIndex = cleanedClassificationResponseText.firstIndex(of: "{"),
+           let jsonObjectEndIndex = cleanedClassificationResponseText.lastIndex(of: "}") {
+            let jsonObjectText = String(cleanedClassificationResponseText[jsonObjectStartIndex...jsonObjectEndIndex])
+            if let jsonObjectData = jsonObjectText.data(using: .utf8),
+               let classificationPayload = try? JSONDecoder().decode(
+                   ActionIntentClassificationPayload.self,
+                   from: jsonObjectData
+               ) {
+                return classificationPayload.intent
+            }
+        }
+
+        let normalizedClassificationResponseText = cleanedClassificationResponseText.lowercased()
+        if normalizedClassificationResponseText.contains("delegate") {
+            return .delegate
+        }
+        if normalizedClassificationResponseText.contains("draft") {
+            return .draft
+        }
+        return .reply
+    }
+
+    private func startMarkdownTranscriptGeneration(
+        transcriptRequest: String,
+        labeledImages: [(data: Data, label: String)]
+    ) {
+        currentMarkdownTranscriptTask?.cancel()
+        currentMarkdownTranscriptTask = Task {
+            defer { currentMarkdownTranscriptTask = nil }
+            latestGeneratedMarkdownTranscriptText = nil
+            companionResponseOverlayManager.showGeneratingMarkdownTranscriptStatus()
+
+            do {
+                let (markdownTranscriptText, _) = try await claudeAPI.analyzeImageStreaming(
+                    images: labeledImages,
+                    systemPrompt: Self.companionMarkdownTranscriptSystemPrompt,
+                    userPrompt: transcriptRequest,
+                    onTextChunk: { [weak self] _ in
+                        guard let self else { return }
+                        self.companionResponseOverlayManager.showGeneratingMarkdownTranscriptStatus()
+                    }
+                )
+
+                guard !Task.isCancelled else { return }
+
+                let savedMarkdownFileURL = try saveMarkdownTranscriptToDownloads(
+                    markdownTranscriptText,
+                    transcriptRequest: transcriptRequest
+                )
+
+                latestGeneratedMarkdownTranscriptText = markdownTranscriptText
+                companionResponseOverlayManager.showReadyToCopyMarkdownTranscriptStatus()
+                print("📝 Markdown transcript saved to \(savedMarkdownFileURL.path)")
+            } catch is CancellationError {
+                latestGeneratedMarkdownTranscriptText = nil
+                companionResponseOverlayManager.hideMarkdownTranscriptOverlay()
+            } catch {
+                latestGeneratedMarkdownTranscriptText = nil
+                companionResponseOverlayManager.showMarkdownTranscriptErrorStatus()
+                print("⚠️ Markdown transcript generation error: \(error)")
+            }
+        }
+    }
+
+    private func saveMarkdownTranscriptToDownloads(
+        _ markdownTranscriptText: String,
+        transcriptRequest: String
+    ) throws -> URL {
+        let fileManager = FileManager.default
+        let downloadsDirectoryURL = fileManager.urls(for: .downloadsDirectory, in: .userDomainMask).first
+            ?? fileManager.homeDirectoryForCurrentUser.appendingPathComponent("Downloads", isDirectory: true)
+        let clickyTranscriptDirectoryURL = downloadsDirectoryURL.appendingPathComponent("Flowee Transcripts", isDirectory: true)
+
+        try fileManager.createDirectory(
+            at: clickyTranscriptDirectoryURL,
+            withIntermediateDirectories: true,
+            attributes: nil
+        )
+
+        let suggestedPrefix = transcriptRequest.lowercased().contains("whiteboard")
+            ? "whiteboard-transcript"
+            : "flowee-transcript"
+
+        let dateFormatter = DateFormatter()
+        dateFormatter.dateFormat = "yyyy-MM-dd-HH-mm-ss"
+        let timestampText = dateFormatter.string(from: Date())
+        let fileURL = clickyTranscriptDirectoryURL.appendingPathComponent("\(suggestedPrefix)-\(timestampText).md")
+
+        try markdownTranscriptText.write(to: fileURL, atomically: true, encoding: .utf8)
+        return fileURL
+    }
 
     /// Captures a screenshot, sends it along with the transcript to Claude,
     /// and plays the response aloud via ElevenLabs TTS. The cursor stays in
@@ -585,7 +936,7 @@ final class CompanionManager: ObservableObject {
     /// the buddy to fly to that element on screen.
     private func sendTranscriptToClaudeWithScreenshot(transcript: String) {
         currentResponseTask?.cancel()
-        elevenLabsTTSClient.stopPlayback()
+        stopAllSpeechPlayback()
 
         currentResponseTask = Task {
             // Stay in processing (spinner) state — no streaming text displayed
@@ -594,6 +945,7 @@ final class CompanionManager: ObservableObject {
             do {
                 // Capture all connected screens so the AI has full context
                 let screenCaptures = try await CompanionScreenCaptureUtility.captureAllScreensAsJPEG()
+                print("🖼️ Companion captured \(screenCaptures.count) screen(s) for Claude")
 
                 guard !Task.isCancelled else { return }
 
@@ -601,8 +953,30 @@ final class CompanionManager: ObservableObject {
                 // so Claude's coordinate space matches the image it sees. We
                 // scale from screenshot pixels to display points ourselves.
                 let labeledImages = screenCaptures.map { capture in
-                    let dimensionInfo = " (image dimensions: \(capture.screenshotWidthInPixels)x\(capture.screenshotHeightInPixels) pixels)"
+                let dimensionInfo = " (image dimensions: \(capture.screenshotWidthInPixels)x\(capture.screenshotHeightInPixels) pixels)"
                     return (data: capture.imageData, label: capture.label + dimensionInfo)
+                }
+
+                let actionIntent = await classifyActionIntent(
+                    transcript: transcript,
+                    labeledImages: labeledImages
+                )
+                currentActionIntent = actionIntent
+
+                if actionIntent == .delegate {
+                    beginDelegationSelection(
+                        transcript: transcript,
+                        screenCaptures: screenCaptures
+                    )
+                    voiceState = .idle
+                    return
+                }
+
+                if Self.shouldGenerateMarkdownTranscript(for: transcript) {
+                    startMarkdownTranscriptGeneration(
+                        transcriptRequest: transcript,
+                        labeledImages: labeledImages
+                    )
                 }
 
                 // Pass conversation history so Claude remembers prior exchanges
@@ -625,6 +999,7 @@ final class CompanionManager: ObservableObject {
                 // Parse the [POINT:...] tag from Claude's response
                 let parseResult = Self.parsePointingCoordinates(from: fullResponseText)
                 let spokenText = parseResult.spokenText
+                print("🧠 Companion response ready: \(spokenText.count) spoken chars")
 
                 // Handle element pointing if Claude returned coordinates.
                 // Switch to idle BEFORE setting the location so the triangle
@@ -707,7 +1082,9 @@ final class CompanionManager: ObservableObject {
                     } catch {
                         ClickyAnalytics.trackTTSError(error: error.localizedDescription)
                         print("⚠️ ElevenLabs TTS error: \(error)")
-                        speakCreditsErrorFallback()
+                        speakErrorFallback(
+                            "Something failed while I was trying to speak. Please check the Xcode console and try again."
+                        )
                     }
                 }
             } catch is CancellationError {
@@ -715,7 +1092,14 @@ final class CompanionManager: ObservableObject {
             } catch {
                 ClickyAnalytics.trackResponseError(error: error.localizedDescription)
                 print("⚠️ Companion response error: \(error)")
-                speakCreditsErrorFallback()
+                let fallbackMessage: String
+                let lowercaseErrorDescription = error.localizedDescription.lowercased()
+                if lowercaseErrorDescription.contains("credit") {
+                    fallbackMessage = "I'm all out of credits. Please top up the connected service and try again."
+                } else {
+                    fallbackMessage = "Something failed while I was generating a response. Please check the Xcode console and try again."
+                }
+                speakErrorFallback(fallbackMessage)
             }
 
             if !Task.isCancelled {
@@ -723,6 +1107,173 @@ final class CompanionManager: ObservableObject {
                 scheduleTransientHideIfNeeded()
             }
         }
+    }
+
+    private func beginDelegationSelection(
+        transcript: String,
+        screenCaptures: [CompanionScreenCapture]
+    ) {
+        delegationAgentRuntimeRegistry.refreshInstalledRuntimes()
+        let allowedWorkspaces = workspaceInventoryStore.enabledWorkspaces
+        guard !allowedWorkspaces.isEmpty else {
+            currentActionIntent = .reply
+            pendingDelegationScreenCaptures = []
+            pendingDelegationRequest = nil
+            isAwaitingDelegationWorkspaceSelection = false
+            selectedDelegationWorkspace = nil
+            selectedDelegationRuntimeID = nil
+            speakErrorFallback("I don't have any allowed workspaces yet. Add one from the Flowee menu first.")
+            return
+        }
+
+        let installedAgentRuntimes = delegationAgentRuntimeRegistry.installedRuntimes
+        guard !installedAgentRuntimes.isEmpty else {
+            currentActionIntent = .reply
+            pendingDelegationScreenCaptures = []
+            pendingDelegationRequest = nil
+            isAwaitingDelegationWorkspaceSelection = false
+            selectedDelegationWorkspace = nil
+            selectedDelegationRuntimeID = nil
+            speakErrorFallback("I couldn't find any supported coding agents on this machine. Install Codex, Claude Code, or OpenCode first.")
+            return
+        }
+
+        pendingDelegationScreenCaptures = screenCaptures
+        pendingDelegationRequest = ClickyDelegationRequest(
+            id: UUID(),
+            transcript: transcript,
+            screenSummary: screenCaptures.map(\.label).joined(separator: " | "),
+            createdAt: Date()
+        )
+        isAwaitingDelegationWorkspaceSelection = true
+        selectedDelegationWorkspace = nil
+        delegationRepoPickerOverlayManager.show(
+            workspaces: allowedWorkspaces,
+            runtimes: installedAgentRuntimes,
+            preselectedWorkspaceID: nil,
+            preselectedRuntimeID: nil,
+            title: "Delegate to workspace",
+            detail: "Choose a workspace and agent runtime",
+            onSelectionConfirmed: { [weak self] selection in
+                self?.handleDelegationSelection(selection)
+            },
+            onCancelled: { [weak self] in
+                self?.cancelPendingDelegationFlow()
+            }
+        )
+        print("🧭 Delegation intent resolved — awaiting workspace selection")
+    }
+
+    func cancelPendingDelegationFlow() {
+        delegationRepoPickerOverlayManager.hide()
+        pendingDelegationScreenCaptures = []
+        pendingDelegationRequest = nil
+        isAwaitingDelegationWorkspaceSelection = false
+        selectedDelegationWorkspace = nil
+        selectedDelegationRuntimeID = nil
+        currentActionIntent = .reply
+    }
+
+    func confirmDelegationSelection(
+        workspace: WorkspaceInventoryStore.WorkspaceRecord,
+        runtimeID: DelegationAgentRuntimeID
+    ) {
+        selectedDelegationWorkspace = workspace
+        selectedDelegationRuntimeID = runtimeID
+        isAwaitingDelegationWorkspaceSelection = false
+        print("🧭 Delegation workspace selected: \(workspace.name) using \(runtimeID.displayName)")
+    }
+
+    private func handleDelegationSelection(_ selection: DelegationRepoPickerOverlayManager.DelegationSelection) {
+        guard let matchedWorkspace = workspaceInventoryStore.workspaces.first(where: { $0.id == selection.workspace.id }),
+              let matchedRuntime = delegationAgentRuntimeRegistry.installedRuntime(for: selection.runtime.id),
+              let pendingDelegationRequest else {
+            cancelPendingDelegationFlow()
+            return
+        }
+
+        confirmDelegationSelection(
+            workspace: matchedWorkspace,
+            runtimeID: matchedRuntime.runtimeID
+        )
+        launchDelegatedAgentForPendingDelegation(
+            request: pendingDelegationRequest,
+            workspace: matchedWorkspace,
+            runtime: matchedRuntime
+        )
+    }
+
+    private func launchDelegatedAgentForPendingDelegation(
+        request: ClickyDelegationRequest,
+        workspace: WorkspaceInventoryStore.WorkspaceRecord,
+        runtime: InstalledDelegationAgentRuntime
+    ) {
+        let launchPrompt = buildDelegatedAgentPrompt(
+            request: request,
+            workspace: workspace
+        )
+
+        Task {
+            do {
+                let launchResult = try await delegationAgentLauncher.launch(
+                    configuration: DelegationAgentLaunchConfiguration(
+                        workspacePath: workspace.path,
+                        prompt: launchPrompt,
+                        runtime: runtime,
+                        modelIdentifier: nil
+                    )
+                )
+                try? workspaceInventoryStore.markLastUsedDelegationRuntime(
+                    workspaceID: workspace.id,
+                    runtimeID: runtime.runtimeID
+                )
+                print("🧭 Delegation started in \(workspace.name) with \(launchResult.runtimeDisplayName), PID \(launchResult.processIdentifier)")
+                print("🧭 Delegation log: \(launchResult.logFileURL.path)")
+                delegationLogSidebarManager.showStreamingLogSidebar(
+                    logFileURL: launchResult.logFileURL,
+                    workspaceName: workspace.name,
+                    runtimeDisplayName: launchResult.runtimeDisplayName,
+                    processIdentifier: launchResult.processIdentifier,
+                    baseBranchName: launchResult.baseBranchName,
+                    workingBranchName: launchResult.workingBranchName,
+                    comparePullRequestURL: launchResult.comparePullRequestURL
+                )
+                speakErrorFallback("\(launchResult.runtimeDisplayName.lowercased()) is starting in \(workspace.name) on a new branch named \(launchResult.workingBranchName). when it finishes, i'll suggest raising a pull request into \(launchResult.baseBranchName).")
+            } catch {
+                print("⚠️ Delegation launch failed: \(error)")
+                speakErrorFallback("I couldn't start \(runtime.displayName) in that workspace. Please check the console and try again.")
+            }
+            cancelPendingDelegationFlow()
+        }
+    }
+
+    private func buildDelegatedAgentPrompt(
+        request: ClickyDelegationRequest,
+        workspace: WorkspaceInventoryStore.WorkspaceRecord
+    ) -> String {
+        let workspaceDescription = workspace.workspaceDescription.isEmpty
+            ? "No additional workspace description was provided."
+            : workspace.workspaceDescription
+
+        return """
+        You are working in the selected workspace: \(workspace.path)
+
+        Workspace context:
+        - Name: \(workspace.name)
+        - Description: \(workspaceDescription)
+
+        User request:
+        \(request.transcript)
+
+        Screen context:
+        \(request.screenSummary)
+
+        Task:
+        - Inspect the repository and determine the smallest coherent change that addresses the request.
+        - Treat the visible screen context as the source of truth for what the user is reacting to.
+        - Make the change if it is well-scoped and safe to implement.
+        - Summarize what changed, what you verified, and any remaining uncertainty.
+        """
     }
 
     /// If the cursor is in transient mode (user toggled "Show Clicky" off),
@@ -736,6 +1287,11 @@ final class CompanionManager: ObservableObject {
         transientHideTask = Task {
             // Wait for TTS audio to finish playing
             while elevenLabsTTSClient.isPlaying {
+                try? await Task.sleep(nanoseconds: 200_000_000)
+                guard !Task.isCancelled else { return }
+            }
+
+            while fallbackSpeechSynthesizer.isSpeaking {
                 try? await Task.sleep(nanoseconds: 200_000_000)
                 guard !Task.isCancelled else { return }
             }
@@ -755,14 +1311,29 @@ final class CompanionManager: ObservableObject {
         }
     }
 
-    /// Speaks a hardcoded error message using macOS system TTS when API
-    /// credits run out. Uses NSSpeechSynthesizer so it works even when
-    /// ElevenLabs is down.
-    private func speakCreditsErrorFallback() {
-        let utterance = "I'm all out of credits. Please DM Farza and tell him to bring me back to life."
-        let synthesizer = NSSpeechSynthesizer()
-        synthesizer.startSpeaking(utterance)
+    private func stopAllSpeechPlayback() {
+        elevenLabsTTSClient.stopPlayback()
+        if fallbackSpeechSynthesizer.isSpeaking {
+            let currentFallbackSpeechIdentifierDescription = currentFallbackSpeechIdentifier?.uuidString ?? "unknown"
+            print("🔊 Fallback speech: stopping [\(currentFallbackSpeechIdentifierDescription)]")
+            fallbackSpeechSynthesizer.stopSpeaking()
+        }
+    }
+
+    /// Speaks a local macOS fallback message when network TTS or response generation fails.
+    private func speakErrorFallback(_ utterance: String) {
+        stopAllSpeechPlayback()
+        let fallbackSpeechIdentifier = UUID()
+        currentFallbackSpeechIdentifier = fallbackSpeechIdentifier
+        print("🔊 Fallback speech: starting [\(fallbackSpeechIdentifier.uuidString)] \(utterance)")
+        fallbackSpeechSynthesizer.startSpeaking(utterance)
         voiceState = .responding
+    }
+
+    func speechSynthesizer(_ sender: NSSpeechSynthesizer, didFinishSpeaking finishedSpeaking: Bool) {
+        let currentFallbackSpeechIdentifierDescription = currentFallbackSpeechIdentifier?.uuidString ?? "unknown"
+        print("🔊 Fallback speech: finished [\(currentFallbackSpeechIdentifierDescription)] success \(finishedSpeaking)")
+        currentFallbackSpeechIdentifier = nil
     }
 
     // MARK: - Point Tag Parsing
@@ -827,7 +1398,11 @@ final class CompanionManager: ObservableObject {
     /// Sets up the onboarding video player, starts playback, and schedules
     /// the demo interaction at 40s. Called by BlueCursorView when onboarding starts.
     func setupOnboardingVideo() {
-        guard let videoURL = URL(string: "https://stream.mux.com/e5jB8UuSrtFABVnTHCR7k3sIsmcUHCyhtLu1tzqLlfs.m3u8") else { return }
+        guard let videoURL = Self.onboardingVideoURL else {
+            // Keep onboarding usable in builds that do not configure a video URL.
+            startOnboardingPromptStream()
+            return
+        }
 
         let player = AVPlayer(url: videoURL)
         player.isMuted = false
@@ -948,7 +1523,7 @@ final class CompanionManager: ObservableObject {
     // MARK: - Onboarding Demo Interaction
 
     private static let onboardingDemoSystemPrompt = """
-    you're clicky, a small blue cursor buddy living on the user's screen. you're showing off during onboarding — look at their screen and find ONE specific, concrete thing to point at. pick something with a clear name or identity: a specific app icon (say its name), a specific word or phrase of text you can read, a specific filename, a specific button label, a specific tab title, a specific image you can describe. do NOT point at vague things like "a window" or "some text" — be specific about exactly what you see.
+    you're flowee, a small purple cursor buddy living on the user's screen. you're showing off during onboarding — look at their screen and find ONE specific, concrete thing to point at. pick something with a clear name or identity: a specific app icon (say its name), a specific word or phrase of text you can read, a specific filename, a specific button label, a specific tab title, a specific image you can describe. do NOT point at vague things like "a window" or "some text" — be specific about exactly what you see.
 
     make a short quirky 3-6 word observation about the specific thing you picked — something fun, playful, or curious that shows you actually read/recognized it. no emojis ever. NEVER quote or repeat text you see on screen — just react to it. keep it to 6 words max, no exceptions.
 
