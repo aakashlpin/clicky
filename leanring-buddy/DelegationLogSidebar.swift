@@ -110,7 +110,12 @@ final class DelegationLogSidebarManager {
         panel.isExcludedFromWindowsMenu = true
 
         let hostingView = NSHostingView(
-            rootView: DelegationLogSidebarView(viewModel: viewModel)
+            rootView: DelegationLogSidebarView(
+                viewModel: viewModel,
+                onCloseSidebarRequested: { [weak self] in
+                    self?.hideStreamingLogSidebar()
+                }
+            )
         )
         hostingView.frame = initialFrame
         panel.contentView = hostingView
@@ -223,9 +228,11 @@ final class DelegationLogSidebarManager {
 
 private struct DelegationLogSidebarView: View {
     @ObservedObject var viewModel: DelegationLogSidebarViewModel
+    let onCloseSidebarRequested: () -> Void
     @State private var scanSweepOffset: CGFloat = -420
     @State private var headerPulseOpacity: Double = 0.45
     @State private var logActivityIntensity: Double = 0.0
+    @State private var isHoveringMacCloseButton: Bool = false
 
     var body: some View {
         ZStack {
@@ -234,6 +241,7 @@ private struct DelegationLogSidebarView: View {
             animatedSweepLayer
 
             VStack(alignment: .leading, spacing: 14) {
+                macWindowControlsRow
                 headerSection
                 logBodySection
                 footerSection
@@ -242,7 +250,7 @@ private struct DelegationLogSidebarView: View {
                 }
             }
             .padding(.horizontal, 16)
-            .padding(.vertical, 18)
+            .padding(.vertical, 14)
         }
         .clipShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
         .overlay(
@@ -316,6 +324,60 @@ private struct DelegationLogSidebarView: View {
                 .opacity(0.55 + (logActivityIntensity * 0.35))
         }
         .allowsHitTesting(false)
+    }
+
+    // Mimics the classic macOS window traffic-light controls. Only the red
+    // close button is interactive here — the yellow and green dots are purely
+    // decorative so the sidebar reads as a familiar native mac window chrome.
+    private var macWindowControlsRow: some View {
+        HStack(spacing: 8) {
+            Button(action: {
+                onCloseSidebarRequested()
+            }) {
+                ZStack {
+                    Circle()
+                        .fill(Color(red: 1.0, green: 0.37, blue: 0.34))
+                        .overlay(
+                            Circle()
+                                .stroke(Color.black.opacity(0.22), lineWidth: 0.5)
+                        )
+                        .shadow(color: Color.black.opacity(0.35), radius: 1, x: 0, y: 0.5)
+
+                    if isHoveringMacCloseButton {
+                        Image(systemName: "xmark")
+                            .font(.system(size: 8, weight: .bold))
+                            .foregroundColor(Color.black.opacity(0.62))
+                    }
+                }
+                .frame(width: 13, height: 13)
+            }
+            .buttonStyle(.plain)
+            .pointerCursor()
+            .onHover { hovering in
+                isHoveringMacCloseButton = hovering
+            }
+            .help("Close delegation stream")
+
+            Circle()
+                .fill(Color(red: 0.98, green: 0.75, blue: 0.18))
+                .overlay(
+                    Circle()
+                        .stroke(Color.black.opacity(0.22), lineWidth: 0.5)
+                )
+                .frame(width: 13, height: 13)
+                .opacity(0.55)
+
+            Circle()
+                .fill(Color(red: 0.24, green: 0.78, blue: 0.27))
+                .overlay(
+                    Circle()
+                        .stroke(Color.black.opacity(0.22), lineWidth: 0.5)
+                )
+                .frame(width: 13, height: 13)
+                .opacity(0.55)
+
+            Spacer()
+        }
     }
 
     private var headerSection: some View {
