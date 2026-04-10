@@ -241,14 +241,15 @@ final class DelegationAgentLauncher {
         let promptWithBranchInstructions = """
         \(configuration.prompt)
 
-        Branch and commit instructions:
+        Branch, commit, and push instructions:
         - You are already on a freshly created branch named \(gitBranchContext.workingBranchName), checked out inside the user's live workspace.
         - The base branch for the eventual pull request is \(gitBranchContext.baseBranchName).
         - Keep all changes on the current branch. Do not switch branches.
-        - CRITICAL: when you finish making changes, you MUST commit them. Run `git add -A` to stage every modified and newly created file, then run `git commit -m "<clear message>"` with a concise message that describes what you changed and why. Without a commit the pull request will be empty.
+        - CRITICAL: when you finish making changes, you MUST commit them. Run `git add -A` to stage every modified and newly created file, then run `git commit -m "<clear message>"` with a concise message that describes what you changed and why. Without a commit the branch will be empty.
         - If the task requires multiple logical steps, make one commit per logical step rather than one giant commit.
-        - Do NOT push to the remote — the user will review the branch locally and push it themselves.
-        - Finish with a short summary that makes it easy to open a pull request from \(gitBranchContext.workingBranchName) into \(gitBranchContext.baseBranchName), and explicitly list the commits you made (subject lines) so the user can verify them.
+        - After committing, push the branch to origin with `git push -u origin \(gitBranchContext.workingBranchName)`. This is required — do NOT skip it. If the push fails (auth, permissions, no origin, etc.), do NOT fail the whole run — instead, clearly report the failure in your final summary so the user can push manually.
+        - Do NOT open a pull request yourself. The user will review the diff on GitHub via an "Open PR" button in the Flowee sidebar (which opens the compare URL) and decide whether to actually create the PR.
+        - Finish with a short summary that: (a) lists the commits you made (subject lines), and (b) states whether the branch was pushed successfully to origin (and if not, why).
         """
 
         switch configuration.runtime.runtimeID {
