@@ -44,6 +44,13 @@ final class DelegationLogSidebarViewModel: ObservableObject {
     @Published var isProcessComplete: Bool = false
     @Published var comparePullRequestURL: URL?
     @Published var isMinimized: Bool = false
+    @Published var worktreeDirectoryPath: String = ""
+    /// Count of commits the delegated agent made on the working branch
+    /// ahead of the base branch, populated after the process exits. Used
+    /// to warn the user when an agent finishes without committing
+    /// anything (which would otherwise produce an empty pull request).
+    /// -1 means "not yet measured".
+    @Published var commitsAheadOfBaseCount: Int = -1
 
     var joinedLogText: String {
         visibleLogLines.joined(separator: "\n")
@@ -438,6 +445,11 @@ private final class DelegationLogSidebarSession {
     let sessionID = UUID()
     let workspacePath: String
     let runtimeID: DelegationAgentRuntimeID
+    /// Absolute path of the isolated git worktree this delegation is
+    /// running inside. Used to run the post-exit `git log` that counts
+    /// commits ahead of the base branch, so the sidebar can warn about
+    /// empty pull requests.
+    let worktreeDirectoryURL: URL
     let viewModel = DelegationLogSidebarViewModel()
 
     var sidebarPanel: NSPanel?
@@ -457,9 +469,14 @@ private final class DelegationLogSidebarSession {
     static let minimizedHeight: CGFloat = 64
     static let maxVisibleLogLines = 320
 
-    init(workspacePath: String, runtimeID: DelegationAgentRuntimeID) {
+    init(
+        workspacePath: String,
+        runtimeID: DelegationAgentRuntimeID,
+        worktreeDirectoryURL: URL
+    ) {
         self.workspacePath = workspacePath
         self.runtimeID = runtimeID
+        self.worktreeDirectoryURL = worktreeDirectoryURL
         if runtimeID == .claude {
             self.claudeStreamJSONParser = DelegationLogClaudeStreamJSONParser()
         }
@@ -501,11 +518,13 @@ final class DelegationLogSidebarManager {
         processIdentifier: Int32,
         baseBranchName: String,
         workingBranchName: String,
-        comparePullRequestURL: URL?
+        comparePullRequestURL: URL?,
+        worktreeDirectoryURL: URL
     ) -> UUID {
         let session = DelegationLogSidebarSession(
             workspacePath: workspacePath,
-            runtimeID: runtimeID
+            runtimeID: runtimeID,
+            worktreeDirectoryURL: worktreeDirectoryURL
         )
         session.monitoredLogFileURL = logFileURL
         session.monitoredProcessIdentifier = processIdentifier
@@ -519,12 +538,15 @@ final class DelegationLogSidebarManager {
         session.viewModel.comparePullRequestURL = comparePullRequestURL
         session.viewModel.isProcessComplete = false
         session.viewModel.isMinimized = false
+        session.viewModel.worktreeDirectoryPath = worktreeDirectoryURL.path
+        session.viewModel.commitsAheadOfBaseCount = -1
         session.viewModel.visibleLogLines = [
             "flowee delegation boot sequence engaged",
             "workspace: \(workspaceName)",
             "agent: \(runtimeDisplayName)",
             "log file: \(logFileURL.lastPathComponent)",
             "branch: \(baseBranchName) -> \(workingBranchName)",
+            "worktree: \(worktreeDirectoryURL.path)",
             ""
         ]
         session.viewModel.statusText = "Streaming live \(runtimeDisplayName) output"
@@ -790,17 +812,107 @@ final class DelegationLogSidebarManager {
         }
 
         session.viewModel.isProcessComplete = true
-        session.viewModel.statusText = "Agent run complete. Raise a PR when you're ready."
-        appendLogText(
-            """
 
-            flowee detected that the delegated agent finished.
-            next move: raise a pr from \(session.viewModel.workingBranchName) into \(session.viewModel.baseBranchName)
-            """,
-            to: session
-        )
+        // Count how many commits the agent made on the working branch
+        // so we can warn the user immediately if the run produced zero
+        // commits (which would make any pull request empty). Run this
+        // as a detached Task so the main actor doesn't block on git.
+        let capturedSessionID = session.sessionID
+        let capturedWorktreePath = session.worktreeDirectoryURL.path
+        let capturedBaseBranchName = session.viewModel.baseBranchName
+        let capturedWorkingBranchName = session.viewModel.workingBranchName
+        Task.detached { [weak self] in
+            let commitsAheadCount = countCommitsAhead(
+                baseBranchName: capturedBaseBranchName,
+                workingBranchName: capturedWorkingBranchName,
+                worktreeDirectoryPath: capturedWorktreePath
+            )
+            await MainActor.run { [weak self] in
+                guard let self,
+                      let sessionStillActive = self.activeSessions[capturedSessionID] else { return }
+                sessionStillActive.viewModel.commitsAheadOfBaseCount = commitsAheadCount
+
+                if commitsAheadCount <= 0 {
+                    sessionStillActive.viewModel.statusText = "Agent run complete — but no commits were made."
+                    self.appendLogText(
+                        """
+
+                        flowee detected that the delegated agent finished.
+                        ⚠ WARNING: the agent exited without committing any changes on \(capturedWorkingBranchName). any pull request will be empty. check the worktree at \(capturedWorktreePath) for uncommitted work, or re-run the delegation.
+                        """,
+                        to: sessionStillActive
+                    )
+                } else {
+                    let commitsLabel = commitsAheadCount == 1 ? "commit" : "commits"
+                    sessionStillActive.viewModel.statusText = "Agent run complete — \(commitsAheadCount) \(commitsLabel) ready. Raise a PR when you're ready."
+                    self.appendLogText(
+                        """
+
+                        flowee detected that the delegated agent finished.
+                        ✓ \(commitsAheadCount) \(commitsLabel) on \(capturedWorkingBranchName) ahead of \(capturedBaseBranchName).
+                        next move: raise a pr from \(capturedWorkingBranchName) into \(capturedBaseBranchName).
+                        """,
+                        to: sessionStillActive
+                    )
+                }
+            }
+        }
+
         stopMonitoringProcessLifecycle(for: session)
     }
+}
+
+/// Runs `git log --oneline <base>..<working>` in the given worktree and
+/// returns the number of commits the working branch is ahead of the
+/// base branch. Returns 0 on any failure so the caller surfaces a
+/// conservative "no commits" warning rather than pretending everything
+/// is fine. This lives at file scope so the detached Task in
+/// `pollProcessLifecycle` can call it off the main actor.
+private func countCommitsAhead(
+    baseBranchName: String,
+    workingBranchName: String,
+    worktreeDirectoryPath: String
+) -> Int {
+    let gitBinaryCandidatePaths = [
+        "/usr/bin/git",
+        "/opt/homebrew/bin/git",
+        "/usr/local/bin/git"
+    ]
+    guard let gitBinaryPath = gitBinaryCandidatePaths.first(where: {
+        FileManager.default.isExecutableFile(atPath: $0)
+    }) else {
+        return 0
+    }
+
+    let gitProcess = Process()
+    gitProcess.executableURL = URL(fileURLWithPath: gitBinaryPath)
+    gitProcess.currentDirectoryURL = URL(fileURLWithPath: worktreeDirectoryPath, isDirectory: true)
+    gitProcess.arguments = [
+        "rev-list",
+        "--count",
+        "\(baseBranchName)..\(workingBranchName)"
+    ]
+
+    let standardOutputPipe = Pipe()
+    let standardErrorPipe = Pipe()
+    gitProcess.standardOutput = standardOutputPipe
+    gitProcess.standardError = standardErrorPipe
+
+    do {
+        try gitProcess.run()
+    } catch {
+        return 0
+    }
+    gitProcess.waitUntilExit()
+
+    guard gitProcess.terminationStatus == 0 else {
+        return 0
+    }
+
+    let standardOutputData = standardOutputPipe.fileHandleForReading.readDataToEndOfFile()
+    let standardOutputText = String(data: standardOutputData, encoding: .utf8)?
+        .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    return Int(standardOutputText) ?? 0
 }
 
 // MARK: - SwiftUI view

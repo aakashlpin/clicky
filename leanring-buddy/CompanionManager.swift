@@ -1303,18 +1303,14 @@ final class CompanionManager: NSObject, ObservableObject, NSSpeechSynthesizerDel
         workspace: WorkspaceInventoryStore.WorkspaceRecord,
         runtime: InstalledDelegationAgentRuntime
     ) {
-        // Guard against clobbering an in-flight delegation in the same
-        // workspace. `CodexExecLauncher.createGitBranchContext` uses
-        // `git branch --show-current` as the base branch, so firing a
-        // second delegation into a workspace that is already on a
-        // `flowee/...` branch would cut a new branch *from* that branch
-        // and silently yank the first agent's working tree out from
-        // under it. Refuse to start the second run in that case.
-        if delegationLogSidebarManager.hasActiveSession(forWorkspacePath: workspace.path) {
-            print("🧭 Delegation refused: \(workspace.name) already has an active agent run. Close its sidebar or wait for it to finish before delegating again.")
-            cancelPendingDelegationFlow()
-            return
-        }
+        // Parallel delegations into the same workspace are now SAFE
+        // because `DelegationAgentLauncher` creates an isolated git
+        // worktree per run. Each agent operates on its own fresh
+        // checkout branched off main, so the user's original working
+        // tree is untouched and two agents in the same workspace
+        // cannot clobber each other's in-flight work. The old
+        // "same-workspace already busy" guard that lived here has
+        // been removed deliberately.
 
         let launchPrompt = buildDelegatedAgentPrompt(
             request: request,
@@ -1360,7 +1356,8 @@ final class CompanionManager: NSObject, ObservableObject, NSSpeechSynthesizerDel
                     processIdentifier: launchResult.processIdentifier,
                     baseBranchName: launchResult.baseBranchName,
                     workingBranchName: launchResult.workingBranchName,
-                    comparePullRequestURL: launchResult.comparePullRequestURL
+                    comparePullRequestURL: launchResult.comparePullRequestURL,
+                    worktreeDirectoryURL: launchResult.worktreeDirectoryURL
                 )
                 // Delegate mode is fully silent — no voice narration. The
                 // delegation log sidebar is the only feedback surface while

@@ -32,6 +32,13 @@ struct DelegationAgentLaunchResult {
     let baseBranchName: String
     let workingBranchName: String
     let comparePullRequestURL: URL?
+    /// Filesystem location of the isolated git worktree the delegated
+    /// agent is operating inside. The user's original workspace
+    /// directory is NEVER touched — the agent lives entirely inside
+    /// this worktree, which is checked out from `baseBranchName` (main
+    /// by default). Future UI can offer a "reveal in Finder" action
+    /// pointing here.
+    let worktreeDirectoryURL: URL
 }
 
 private struct GitCommandResult {
@@ -44,6 +51,7 @@ private struct GitBranchContext {
     let baseBranchName: String
     let workingBranchName: String
     let comparePullRequestURL: URL?
+    let worktreeDirectoryURL: URL
 }
 
 enum DelegationAgentLaunchError: LocalizedError {
@@ -84,7 +92,13 @@ final class DelegationAgentLauncher {
 
         let process = Process()
         process.executableURL = URL(fileURLWithPath: configuration.runtime.binaryPath)
-        process.currentDirectoryURL = URL(fileURLWithPath: configuration.workspacePath, isDirectory: true)
+        // The delegated agent runs inside the dedicated git worktree,
+        // NOT inside the user's original workspace. This keeps the
+        // user's working tree, their current branch, and any
+        // uncommitted local edits completely untouched, and it lets
+        // multiple parallel delegations into the same workspace run
+        // safely because each one has its own isolated checkout.
+        process.currentDirectoryURL = gitBranchContext.worktreeDirectoryURL
         process.arguments = makeArguments(
             for: configuration,
             gitBranchContext: gitBranchContext
@@ -130,7 +144,8 @@ final class DelegationAgentLauncher {
             runtimeDisplayName: configuration.runtime.displayName,
             baseBranchName: gitBranchContext.baseBranchName,
             workingBranchName: gitBranchContext.workingBranchName,
-            comparePullRequestURL: gitBranchContext.comparePullRequestURL
+            comparePullRequestURL: gitBranchContext.comparePullRequestURL,
+            worktreeDirectoryURL: gitBranchContext.worktreeDirectoryURL
         )
     }
 
@@ -138,23 +153,49 @@ final class DelegationAgentLauncher {
         forWorkspacePath workspacePath: String,
         suggestedBranchNameHint: String?
     ) async throws -> GitBranchContext {
-        let baseBranchName = try await resolveCurrentGitBranchName(in: workspacePath)
+        // Always prefer main (or master, or the remote default branch)
+        // as the base the delegated agent branches off. The user's
+        // currently checked-out branch is deliberately ignored so agent
+        // branches are always simple to review and merge, regardless of
+        // whether the user is on a feature branch, a prior flowee branch,
+        // or anything else when they fire off the delegation.
+        let baseBranchName = try await resolveDelegationBaseBranchName(in: workspacePath)
         let workingBranchName = try await chooseDelegationBranchName(
             workspacePath: workspacePath,
             baseBranchName: baseBranchName,
             suggestedBranchNameHint: suggestedBranchNameHint
         )
 
-        let checkoutResult = try await runGitCommand(
-            arguments: ["checkout", "-b", workingBranchName, baseBranchName],
+        // Delegated runs live inside a dedicated git worktree under
+        // Application Support. Worktrees share the main repo's object
+        // database but have an isolated working tree, so:
+        //   1. the user's own workspace directory is completely
+        //      untouched (no branch switch, no stash dance),
+        //   2. multiple parallel delegations into the same workspace
+        //      can safely run in parallel because each has its own
+        //      checkout, and
+        //   3. the agent branches off main/master regardless of what
+        //      branch the user had checked out.
+        let worktreeDirectoryURL = try makeDelegationWorktreeDirectoryURL(
+            workingBranchName: workingBranchName
+        )
+
+        let worktreeAddResult = try await runGitCommand(
+            arguments: [
+                "worktree",
+                "add",
+                "-b", workingBranchName,
+                worktreeDirectoryURL.path,
+                baseBranchName
+            ],
             in: workspacePath
         )
 
-        guard checkoutResult.exitCode == 0 else {
-            let trimmedErrorText = checkoutResult.standardError.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard worktreeAddResult.exitCode == 0 else {
+            let trimmedErrorText = worktreeAddResult.standardError.trimmingCharacters(in: .whitespacesAndNewlines)
             throw DelegationAgentLaunchError.gitCommandFailed(
                 trimmedErrorText.isEmpty
-                    ? "git checkout -b \(workingBranchName) \(baseBranchName) exited with status \(checkoutResult.exitCode)"
+                    ? "git worktree add -b \(workingBranchName) \(worktreeDirectoryURL.path) \(baseBranchName) exited with status \(worktreeAddResult.exitCode)"
                     : trimmedErrorText
             )
         }
@@ -168,8 +209,87 @@ final class DelegationAgentLauncher {
         return GitBranchContext(
             baseBranchName: baseBranchName,
             workingBranchName: workingBranchName,
-            comparePullRequestURL: comparePullRequestURL
+            comparePullRequestURL: comparePullRequestURL,
+            worktreeDirectoryURL: worktreeDirectoryURL
         )
+    }
+
+    /// Resolves the base branch for a new delegation, preferring the
+    /// project's canonical base (main → master → remote HEAD default)
+    /// over whatever the user currently has checked out.
+    private func resolveDelegationBaseBranchName(in workspacePath: String) async throws -> String {
+        let localMainBranchExists = try await localGitBranchExists(
+            branchName: "main",
+            in: workspacePath
+        )
+        if localMainBranchExists {
+            return "main"
+        }
+
+        let localMasterBranchExists = try await localGitBranchExists(
+            branchName: "master",
+            in: workspacePath
+        )
+        if localMasterBranchExists {
+            return "master"
+        }
+
+        // Fall back to whatever the remote says its default branch is,
+        // for repos that use a non-standard default (e.g. `trunk`).
+        let remoteHeadResult = try await runGitCommand(
+            arguments: ["symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"],
+            in: workspacePath
+        )
+        let remoteHeadShortName = remoteHeadResult.standardOutput
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if remoteHeadResult.exitCode == 0,
+           !remoteHeadShortName.isEmpty,
+           let lastPathComponent = remoteHeadShortName.split(separator: "/").last {
+            return String(lastPathComponent)
+        }
+
+        // Last-resort fallback: whatever the user had checked out. This
+        // branch only fires for repos with no main, no master, and no
+        // remote HEAD — extremely rare in practice.
+        return try await resolveCurrentGitBranchName(in: workspacePath)
+    }
+
+    /// Builds a unique, deterministic worktree directory URL for a
+    /// delegation. Worktrees are placed under
+    /// `~/Library/Application Support/Flowee/Worktrees/<flattened-branch>`
+    /// so they live alongside the delegation logs but never spill into
+    /// the user's own workspace directory.
+    private func makeDelegationWorktreeDirectoryURL(
+        workingBranchName: String
+    ) throws -> URL {
+        let applicationSupportDirectoryURL = try fileManager.url(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask,
+            appropriateFor: nil,
+            create: true
+        )
+
+        let worktreesParentDirectoryURL = applicationSupportDirectoryURL
+            .appendingPathComponent("Flowee", isDirectory: true)
+            .appendingPathComponent("Worktrees", isDirectory: true)
+
+        try fileManager.createDirectory(
+            at: worktreesParentDirectoryURL,
+            withIntermediateDirectories: true,
+            attributes: nil
+        )
+
+        // `git worktree add` fails if the target path already exists.
+        // The working branch name is unique (`chooseDelegationBranchName`
+        // already resolves collisions), so the derived folder name is
+        // unique too. We flatten slashes to dashes so nested branch
+        // names like `flowee/feature/foo` become a single-segment
+        // directory `flowee-feature-foo`.
+        let flattenedBranchFolderName = workingBranchName
+            .replacingOccurrences(of: "/", with: "-")
+
+        return worktreesParentDirectoryURL
+            .appendingPathComponent(flattenedBranchFolderName, isDirectory: true)
     }
 
     private func makeArguments(
@@ -179,17 +299,27 @@ final class DelegationAgentLauncher {
         let promptWithBranchInstructions = """
         \(configuration.prompt)
 
-        Branch instructions:
-        - You are already on a freshly created branch named \(gitBranchContext.workingBranchName).
+        Branch and commit instructions:
+        - You are already on a freshly created branch named \(gitBranchContext.workingBranchName), checked out inside an isolated git worktree at \(gitBranchContext.worktreeDirectoryURL.path).
         - The base branch for the eventual pull request is \(gitBranchContext.baseBranchName).
-        - Keep all changes on the current branch.
-        - Do not switch branches.
-        - Finish with a summary that makes it easy to open a pull request from \(gitBranchContext.workingBranchName) into \(gitBranchContext.baseBranchName).
+        - Keep all changes on the current branch. Do not switch branches.
+        - CRITICAL: when you finish making changes, you MUST commit them. Run `git add -A` to stage every modified and newly created file, then run `git commit -m "<clear message>"` with a concise message that describes what you changed and why. Without a commit the pull request will be empty.
+        - If the task requires multiple logical steps, make one commit per logical step rather than one giant commit.
+        - Do NOT push to the remote — the user will review the branch locally and push it themselves.
+        - Finish with a short summary that makes it easy to open a pull request from \(gitBranchContext.workingBranchName) into \(gitBranchContext.baseBranchName), and explicitly list the commits you made (subject lines) so the user can verify them.
         """
+
+        // Every runtime runs with its working directory pointed at the
+        // dedicated git worktree, not the user's original workspace.
+        // For runtimes that also take an explicit directory flag
+        // (`codex -C`, `opencode --dir`), we pass the worktree path
+        // there too so the CLI doesn't accidentally resolve paths in
+        // the user's workspace by itself.
+        let worktreeDirectoryPath = gitBranchContext.worktreeDirectoryURL.path
 
         switch configuration.runtime.runtimeID {
         case .codex:
-            var arguments = ["exec", "--full-auto", "-C", configuration.workspacePath]
+            var arguments = ["exec", "--full-auto", "-C", worktreeDirectoryPath]
             if let modelIdentifier = configuration.modelIdentifier, !modelIdentifier.isEmpty {
                 arguments.append(contentsOf: ["--model", modelIdentifier])
             }
