@@ -8,12 +8,14 @@
 //
 
 import AppKit
+import ImageIO
 import ScreenCaptureKit
 
 struct CompanionScreenCapture {
     let imageData: Data
     let label: String
     let isCursorScreen: Bool
+    let displayID: CGDirectDisplayID
     let displayWidthInPoints: Int
     let displayHeightInPoints: Int
     let displayFrame: CGRect
@@ -24,10 +26,20 @@ struct CompanionScreenCapture {
 @MainActor
 enum CompanionScreenCaptureUtility {
 
-    /// Captures all connected displays as JPEG data, labeling each with
-    /// whether the user's cursor is on that screen. This gives the AI
-    /// full context across multiple monitors.
-    static func captureAllScreensAsJPEG() async throws -> [CompanionScreenCapture] {
+    /// Captures connected displays as JPEG data, labeling each with
+    /// whether the user's cursor is on that screen. By default this
+    /// captures every connected display, but when `restrictToDisplayID`
+    /// is supplied only that single display is captured — the PTT path
+    /// uses this to send Claude just the screen the user cares about
+    /// (either the one they drew a focus rectangle on, or the one the
+    /// cursor is currently sitting on) instead of a composite of every
+    /// connected monitor. If the requested `restrictToDisplayID` can't
+    /// be found in the current display list (e.g. monitor unplugged
+    /// mid-session), the function falls back to the cursor's display.
+    static func captureAllScreensAsJPEG(
+        highlightFocusRectangle: FocusRectangle? = nil,
+        restrictToDisplayID: CGDirectDisplayID? = nil
+    ) async throws -> [CompanionScreenCapture] {
         let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
 
         guard !content.displays.isEmpty else {
@@ -58,7 +70,7 @@ enum CompanionScreenCaptureUtility {
         }
 
         // Sort displays so the cursor screen is always first
-        let sortedDisplays = content.displays.sorted { displayA, displayB in
+        let sortedDisplaysBeforeRestriction = content.displays.sorted { displayA, displayB in
             let frameA = nsScreenByDisplayID[displayA.displayID]?.frame ?? displayA.frame
             let frameB = nsScreenByDisplayID[displayB.displayID]?.frame ?? displayB.frame
             let aContainsCursor = frameA.contains(mouseLocation)
@@ -66,6 +78,25 @@ enum CompanionScreenCaptureUtility {
             if aContainsCursor != bContainsCursor { return aContainsCursor }
             return false
         }
+
+        // If the caller requested a single display, filter down to just
+        // that one. If the requested display isn't present (e.g. the
+        // user unplugged a monitor between push-to-talk press and
+        // capture), fall back to the cursor's display — which, because
+        // of the sort above, is always the first entry.
+        let sortedDisplays: [SCDisplay] = {
+            guard let restrictToDisplayID else {
+                return sortedDisplaysBeforeRestriction
+            }
+            if let matchingDisplay = sortedDisplaysBeforeRestriction.first(where: { $0.displayID == restrictToDisplayID }) {
+                return [matchingDisplay]
+            }
+            if let cursorDisplayFallback = sortedDisplaysBeforeRestriction.first {
+                print("⚠️ Requested display \(restrictToDisplayID) not found in current display list — falling back to cursor display \(cursorDisplayFallback.displayID)")
+                return [cursorDisplayFallback]
+            }
+            return []
+        }()
 
         var capturedScreens: [CompanionScreenCapture] = []
 
@@ -101,6 +132,24 @@ enum CompanionScreenCaptureUtility {
                 continue
             }
 
+            // If the caller supplied a focus rectangle that belongs to THIS display,
+            // stamp it onto the JPEG before appending. Our overlay windows are filtered
+            // out of the live screenshot (see SCContentFilter above), so the yellow
+            // border must be drawn into the image bytes after capture.
+            let jpegDataToUse: Data
+            if let highlightFocusRectangle,
+               highlightFocusRectangle.displayID == display.displayID {
+                jpegDataToUse = compositeFocusRectangleIfPossible(
+                    originalJpegData: jpegData,
+                    focusRectangleInDisplayPoints: highlightFocusRectangle.rectInDisplayPoints,
+                    displayFrame: displayFrame,
+                    screenshotWidthInPixels: configuration.width,
+                    screenshotHeightInPixels: configuration.height
+                )
+            } else {
+                jpegDataToUse = jpegData
+            }
+
             let screenLabel: String
             if sortedDisplays.count == 1 {
                 screenLabel = "user's screen (cursor is here)"
@@ -111,9 +160,10 @@ enum CompanionScreenCaptureUtility {
             }
 
             capturedScreens.append(CompanionScreenCapture(
-                imageData: jpegData,
+                imageData: jpegDataToUse,
                 label: screenLabel,
                 isCursorScreen: isCursorScreen,
+                displayID: display.displayID,
                 displayWidthInPoints: Int(displayFrame.width),
                 displayHeightInPoints: Int(displayFrame.height),
                 displayFrame: displayFrame,
@@ -128,5 +178,157 @@ enum CompanionScreenCaptureUtility {
         }
 
         return capturedScreens
+    }
+
+    /// Stamps a warm-yellow border for the user's focus rectangle onto the captured
+    /// JPEG for a single display. The input rect is in AppKit display-local points
+    /// (bottom-left origin, matching NSEvent.mouseLocation); the output is re-encoded
+    /// JPEG data in the same pixel dimensions as the original. On ANY failure (clamp
+    /// to empty, decode error, context error, re-encode error) we log a single
+    /// diagnostic line and return the original JPEG so the user still gets a response.
+    private static func compositeFocusRectangleIfPossible(
+        originalJpegData: Data,
+        focusRectangleInDisplayPoints: CGRect,
+        displayFrame: CGRect,
+        screenshotWidthInPixels: Int,
+        screenshotHeightInPixels: Int
+    ) -> Data {
+        // Clamp the incoming rect to the display's bounds so a runaway drag
+        // off-screen can't produce negative or out-of-bounds coordinates.
+        let displayBoundsInDisplayPoints = CGRect(origin: .zero, size: displayFrame.size)
+        let clampedFocusRectangleInDisplayPoints = focusRectangleInDisplayPoints
+            .intersection(displayBoundsInDisplayPoints)
+
+        if clampedFocusRectangleInDisplayPoints.isNull
+            || clampedFocusRectangleInDisplayPoints.isEmpty
+            || clampedFocusRectangleInDisplayPoints.width <= 0
+            || clampedFocusRectangleInDisplayPoints.height <= 0 {
+            print("⚠️ Focus rectangle compositing skipped: clamped rect is empty or zero-size")
+            return originalJpegData
+        }
+
+        // Decode the JPEG back into a CGImage via Core Graphics' native path.
+        // We deliberately do NOT route through NSBitmapImageRep(data:).cgImage
+        // here: that accessor has had orientation quirks across macOS versions
+        // when decoding a JPEG that was itself encoded by NSBitmapImageRep
+        // (which is exactly what the outer loop does at the top of
+        // captureAllScreensAsJPEG before handing the bytes to this function).
+        // In those cases the resulting CGImage's pixel rows can be bottom-up,
+        // and when it's drawn into our flipped CGContext the two flips
+        // compound into a vertically inverted output. CGImageSource is
+        // deterministic and always returns a natively top-down CGImage.
+        guard let cgImageSource = CGImageSourceCreateWithData(originalJpegData as CFData, nil),
+              let decodedCGImage = CGImageSourceCreateImageAtIndex(cgImageSource, 0, nil) else {
+            print("⚠️ Focus rectangle compositing skipped: failed to decode JPEG back to CGImage")
+            return originalJpegData
+        }
+
+        let sRGBColorSpace = CGColorSpaceCreateDeviceRGB()
+        let bitmapInfoRawValue: UInt32 = CGImageAlphaInfo.premultipliedLast.rawValue
+        guard let compositingContext = CGContext(
+            data: nil,
+            width: screenshotWidthInPixels,
+            height: screenshotHeightInPixels,
+            bitsPerComponent: 8,
+            bytesPerRow: 0,
+            space: sRGBColorSpace,
+            bitmapInfo: bitmapInfoRawValue
+        ) else {
+            print("⚠️ Focus rectangle compositing skipped: failed to create CGContext")
+            return originalJpegData
+        }
+
+        // CGContext defaults to bottom-left origin. Flipping the Y axis BEFORE we
+        // draw the image means all subsequent coordinates in this context are in
+        // top-left-origin space, which is easier to reason about when mapping from
+        // screenshot pixel math.
+        compositingContext.translateBy(x: 0, y: CGFloat(screenshotHeightInPixels))
+        compositingContext.scaleBy(x: 1, y: -1)
+
+        let fullScreenshotRectInPixels = CGRect(
+            x: 0,
+            y: 0,
+            width: CGFloat(screenshotWidthInPixels),
+            height: CGFloat(screenshotHeightInPixels)
+        )
+        compositingContext.draw(decodedCGImage, in: fullScreenshotRectInPixels)
+
+        // Convert the clamped focus rect from AppKit display-local points
+        // (bottom-left origin) to screenshot pixel coordinates (top-left origin).
+        //
+        // AppKit says the rect's bottom-left Y is clampedFocusRectangle.origin.y.
+        // To get the rect's TOP-left Y in the same bottom-left coordinate system
+        // we add its height, then subtract from displayHeight to flip the axis
+        // to top-left origin. Finally we scale by the per-axis screenshot-to-display
+        // ratio to land in screenshot pixel space.
+        let displayWidthInDisplayPoints = displayFrame.width
+        let displayHeightInDisplayPoints = displayFrame.height
+
+        guard displayWidthInDisplayPoints > 0, displayHeightInDisplayPoints > 0 else {
+            print("⚠️ Focus rectangle compositing skipped: display frame has zero size")
+            return originalJpegData
+        }
+
+        let screenshotToDisplayScaleX = CGFloat(screenshotWidthInPixels) / displayWidthInDisplayPoints
+        let screenshotToDisplayScaleY = CGFloat(screenshotHeightInPixels) / displayHeightInDisplayPoints
+
+        let topLeftYInDisplayPoints = displayHeightInDisplayPoints
+            - (clampedFocusRectangleInDisplayPoints.origin.y + clampedFocusRectangleInDisplayPoints.height)
+
+        let focusRectangleInScreenshotPixels = CGRect(
+            x: clampedFocusRectangleInDisplayPoints.origin.x * screenshotToDisplayScaleX,
+            y: topLeftYInDisplayPoints * screenshotToDisplayScaleY,
+            width: clampedFocusRectangleInDisplayPoints.width * screenshotToDisplayScaleX,
+            height: clampedFocusRectangleInDisplayPoints.height * screenshotToDisplayScaleY
+        )
+
+        // Warm bright yellow — more readable against real UI than pure #FFFF00,
+        // which tends to vibrate uncomfortably against light backgrounds.
+        let warmYellowStrokeColor = CGColor(red: 1.0, green: 0.85, blue: 0.0, alpha: 1.0)
+        compositingContext.setLineWidth(6)
+        compositingContext.setStrokeColor(warmYellowStrokeColor)
+        compositingContext.stroke(focusRectangleInScreenshotPixels)
+
+        guard let compositedCGImage = compositingContext.makeImage() else {
+            print("⚠️ Focus rectangle compositing skipped: makeImage() returned nil")
+            return originalJpegData
+        }
+
+        // Encode via Core Graphics' native JPEG encoder (CGImageDestination).
+        // We deliberately do NOT route through NSBitmapImageRep(cgImage:) here
+        // because that wrapper reads the CGImage's backing store with its own
+        // assumptions about pixel row order, and for a CGImage that came out
+        // of a flipped CGBitmapContext the rows are in the opposite order
+        // from what NSBitmapImageRep expects — the result is a vertically
+        // inverted JPEG. CGImageDestinationAddImage preserves the CGImage's
+        // orientation metadata directly and produces a correct JPEG regardless
+        // of how the source context's CTM was configured during drawing.
+        let jpegDestinationData = NSMutableData()
+        guard let imageDestination = CGImageDestinationCreateWithData(
+            jpegDestinationData,
+            "public.jpeg" as CFString,
+            1,
+            nil
+        ) else {
+            print("⚠️ Focus rectangle compositing skipped: failed to create CGImageDestination for JPEG")
+            return originalJpegData
+        }
+
+        let jpegCompressionQualityForCompositedImage: Double = 0.8
+        let imageDestinationOptions: [CFString: Any] = [
+            kCGImageDestinationLossyCompressionQuality: jpegCompressionQualityForCompositedImage
+        ]
+        CGImageDestinationAddImage(
+            imageDestination,
+            compositedCGImage,
+            imageDestinationOptions as CFDictionary
+        )
+
+        guard CGImageDestinationFinalize(imageDestination) else {
+            print("⚠️ Focus rectangle compositing skipped: CGImageDestinationFinalize failed")
+            return originalJpegData
+        }
+
+        return jpegDestinationData as Data
     }
 }

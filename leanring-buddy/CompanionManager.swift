@@ -68,6 +68,7 @@ final class CompanionManager: NSObject, ObservableObject, NSSpeechSynthesizerDel
     let buddyDictationManager = BuddyDictationManager()
     let globalPushToTalkShortcutMonitor = GlobalPushToTalkShortcutMonitor()
     let overlayWindowManager = OverlayWindowManager()
+    let focusRectangleDrawingOverlayManager = FocusRectangleDrawingOverlayManager()
     let companionResponseOverlayManager = CompanionResponseOverlayManager()
     let delegationRepoPickerOverlayManager = DelegationRepoPickerOverlayManager()
     let delegationLogSidebarManager = DelegationLogSidebarManager()
@@ -121,6 +122,17 @@ final class CompanionManager: NSObject, ObservableObject, NSSpeechSynthesizerDel
     /// Separate task for markdown transcript generation so it can stream into
     /// the cursor-adjacent card while the spoken response continues normally.
     private var currentMarkdownTranscriptTask: Task<Void, Never>?
+
+    /// A transcript that was finalized by AssemblyAI while the user was still
+    /// mid-drag on the focus-rectangle drawing overlay. Held here until the
+    /// drag resolves (FocusRectangleDrawingOverlayManager fires
+    /// onAnyDragCompleted), at which point the transcript is dispatched to
+    /// Claude with the completed rectangle. This is the "fires on whichever
+    /// comes later" symmetry for the push-to-talk + focus-rectangle drag
+    /// two-input-release problem: whichever input (keyboard or mouse) the
+    /// user releases last is the one that triggers the screenshot, so the
+    /// rectangle is never dropped because of a few-millisecond release gap.
+    private var pendingTranscriptAwaitingDragCompletion: String?
 
     private var shortcutTransitionCancellable: AnyCancellable?
     private var stopSpeechPlaybackShortcutCancellable: AnyCancellable?
@@ -196,9 +208,11 @@ final class CompanionManager: NSObject, ObservableObject, NSSpeechSynthesizerDel
         if enabled {
             overlayWindowManager.hasShownOverlayBefore = true
             overlayWindowManager.showOverlay(onScreens: NSScreen.screens, companionManager: self)
+            focusRectangleDrawingOverlayManager.showDrawingOverlays(onScreens: NSScreen.screens)
             isOverlayVisible = true
         } else {
             overlayWindowManager.hideOverlay()
+            focusRectangleDrawingOverlayManager.hideDrawingOverlays()
             isOverlayVisible = false
         }
     }
@@ -238,6 +252,16 @@ final class CompanionManager: NSObject, ObservableObject, NSSpeechSynthesizerDel
 
     func start() {
         fallbackSpeechSynthesizer.delegate = self
+        // Wire the focus-rectangle drag completion callback. When the user
+        // drew a rectangle and we held the transcript because the drag was
+        // still in progress at finalization time, the manager fires this
+        // callback as soon as the drag's mouseUp lands. We then release the
+        // queued transcript so the screenshot + Claude call run with the
+        // completed rectangle. See pendingTranscriptAwaitingDragCompletion
+        // for the full "fires on whichever comes later" rationale.
+        focusRectangleDrawingOverlayManager.onAnyDragCompleted = { [weak self] in
+            self?.dispatchPendingTranscriptIfAny()
+        }
         globalPushToTalkShortcutMonitor.shouldConsumeEscapeKey = { [weak self] in
             guard let self else { return false }
             return self.elevenLabsTTSClient.isPlaying || self.fallbackSpeechSynthesizer.isSpeaking
@@ -273,6 +297,7 @@ final class CompanionManager: NSObject, ObservableObject, NSSpeechSynthesizerDel
         if hasCompletedOnboarding && allPermissionsGranted && isClickyCursorEnabled {
             overlayWindowManager.hasShownOverlayBefore = true
             overlayWindowManager.showOverlay(onScreens: NSScreen.screens, companionManager: self)
+            focusRectangleDrawingOverlayManager.showDrawingOverlays(onScreens: NSScreen.screens)
             isOverlayVisible = true
         }
     }
@@ -297,6 +322,7 @@ final class CompanionManager: NSObject, ObservableObject, NSSpeechSynthesizerDel
         // Show the overlay for the first time — isFirstAppearance triggers
         // the welcome animation and onboarding video
         overlayWindowManager.showOverlay(onScreens: NSScreen.screens, companionManager: self)
+        focusRectangleDrawingOverlayManager.showDrawingOverlays(onScreens: NSScreen.screens)
         isOverlayVisible = true
     }
 
@@ -310,6 +336,7 @@ final class CompanionManager: NSObject, ObservableObject, NSSpeechSynthesizerDel
         // Tear down any existing overlays and recreate with isFirstAppearance = true
         overlayWindowManager.hasShownOverlayBefore = false
         overlayWindowManager.showOverlay(onScreens: NSScreen.screens, companionManager: self)
+        focusRectangleDrawingOverlayManager.showDrawingOverlays(onScreens: NSScreen.screens)
         isOverlayVisible = true
     }
 
@@ -380,12 +407,14 @@ final class CompanionManager: NSObject, ObservableObject, NSSpeechSynthesizerDel
         cancelPendingDelegationFlow()
         delegationLogSidebarManager.hideAllSessions()
         overlayWindowManager.hideOverlay()
+        focusRectangleDrawingOverlayManager.hideDrawingOverlays()
         transientHideTask?.cancel()
 
         currentResponseTask?.cancel()
         currentMarkdownTranscriptTask?.cancel()
         currentResponseTask = nil
         currentMarkdownTranscriptTask = nil
+        pendingTranscriptAwaitingDragCompletion = nil
         shortcutTransitionCancellable?.cancel()
         stopSpeechPlaybackShortcutCancellable?.cancel()
         markdownTranscriptCopyShortcutCancellable?.cancel()
@@ -479,6 +508,7 @@ final class CompanionManager: NSObject, ObservableObject, NSSpeechSynthesizerDel
                     if hasCompletedOnboarding && allPermissionsGranted && !isOverlayVisible && isClickyCursorEnabled {
                         overlayWindowManager.hasShownOverlayBefore = true
                         overlayWindowManager.showOverlay(onScreens: NSScreen.screens, companionManager: self)
+                        focusRectangleDrawingOverlayManager.showDrawingOverlays(onScreens: NSScreen.screens)
                         isOverlayVisible = true
                     }
                 }
@@ -643,8 +673,16 @@ final class CompanionManager: NSObject, ObservableObject, NSSpeechSynthesizerDel
             if !isClickyCursorEnabled && !isOverlayVisible {
                 overlayWindowManager.hasShownOverlayBefore = true
                 overlayWindowManager.showOverlay(onScreens: NSScreen.screens, companionManager: self)
+                focusRectangleDrawingOverlayManager.showDrawingOverlays(onScreens: NSScreen.screens)
                 isOverlayVisible = true
             }
+
+            // Arm the per-screen focus-rectangle drawing overlays so the user can
+            // optionally click-drag a bright region on top of the app they're
+            // asking about while they speak. The rectangle (if drawn) gets
+            // composited onto the screenshot sent to Claude in
+            // sendTranscriptToClaudeWithScreenshot below.
+            focusRectangleDrawingOverlayManager.armDrawing()
 
             // Dismiss the menu bar panel so it doesn't cover the screen
             NotificationCenter.default.post(name: .clickyDismissPanel, object: nil)
@@ -654,6 +692,10 @@ final class CompanionManager: NSObject, ObservableObject, NSSpeechSynthesizerDel
             currentMarkdownTranscriptTask?.cancel()
             currentMarkdownTranscriptTask = nil
             latestGeneratedMarkdownTranscriptText = nil
+            // Drop any transcript that was queued pending drag completion from
+            // a previous turn. Starting a new push-to-talk press semantically
+            // cancels that previous turn.
+            pendingTranscriptAwaitingDragCompletion = nil
             cancelPendingDelegationFlow()
             stopAllSpeechPlayback()
             clearDetectedElementLocation()
@@ -681,10 +723,11 @@ final class CompanionManager: NSObject, ObservableObject, NSSpeechSynthesizerDel
                         // Partial transcripts are hidden (waveform-only UI)
                     },
                     submitDraftText: { [weak self] finalTranscript in
-                        self?.lastTranscript = finalTranscript
+                        guard let self else { return }
+                        self.lastTranscript = finalTranscript
                         print("🗣️ Companion received transcript: \(finalTranscript)")
                         ClickyAnalytics.trackUserMessageSent(transcript: finalTranscript)
-                        self?.sendTranscriptToClaudeWithScreenshot(transcript: finalTranscript)
+                        self.dispatchFinalizedTranscriptOrWaitForDrag(finalTranscript)
                     }
                 )
             }
@@ -697,6 +740,15 @@ final class CompanionManager: NSObject, ObservableObject, NSSpeechSynthesizerDel
             pendingKeyboardShortcutStartTask?.cancel()
             pendingKeyboardShortcutStartTask = nil
             buddyDictationManager.stopPushToTalkFromKeyboardShortcut()
+            // Turn off the focus-rectangle drawing arm latch but DO NOT kill
+            // an in-progress drag. finishPendingDragThenDisarm() leaves any
+            // in-flight drag untouched so its mouseUp can still land and the
+            // rectangle the user is drawing is captured. If no drag is in
+            // progress, it disarms every overlay immediately (same behavior
+            // as the old disarmDrawing path). This is half of the "fires on
+            // whichever comes later" symmetry — the other half lives in
+            // dispatchFinalizedTranscriptOrWaitForDrag below.
+            focusRectangleDrawingOverlayManager.finishPendingDragThenDisarm()
         case .none:
             break
         }
@@ -1043,6 +1095,47 @@ final class CompanionManager: NSObject, ObservableObject, NSSpeechSynthesizerDel
         return fileURL
     }
 
+    /// Decides whether to fire a freshly-finalized transcript immediately or
+    /// hold it until the user's in-progress focus-rectangle drag completes.
+    ///
+    /// When the user presses push-to-talk and draws a rectangle at the same
+    /// time, the two release events (keyboard up, mouse up) typically land a
+    /// few milliseconds apart — and in either order, depending on the user's
+    /// muscle memory. AssemblyAI's transcript finalization is driven by the
+    /// keyboard release (via stopPushToTalkFromKeyboardShortcut), so by the
+    /// time this function runs, the keyboard is already up; we only need to
+    /// check whether the MOUSE drag is still in flight.
+    ///
+    /// If it is, we stash the transcript and return. Once the drag's mouseUp
+    /// lands, FocusRectangleDrawingOverlayManager fires the onAnyDragCompleted
+    /// callback registered in start(), which calls dispatchPendingTranscriptIfAny
+    /// to release the queued transcript with the completed rectangle.
+    ///
+    /// This is the "fires on whichever comes later" symmetry: the screenshot
+    /// goes out only after BOTH inputs have released, so a rectangle the user
+    /// drew is never dropped because of a release-timing race.
+    private func dispatchFinalizedTranscriptOrWaitForDrag(_ finalTranscript: String) {
+        if focusRectangleDrawingOverlayManager.isDragInProgress {
+            pendingTranscriptAwaitingDragCompletion = finalTranscript
+            print("🗣️ Transcript held pending focus-rectangle drag completion")
+            return
+        }
+        sendTranscriptToClaudeWithScreenshot(transcript: finalTranscript)
+    }
+
+    /// Fires any transcript that was queued pending focus-rectangle drag
+    /// completion. Called by FocusRectangleDrawingOverlayManager's
+    /// onAnyDragCompleted callback (registered in start()) every time a
+    /// drag's mouseUp lands, regardless of whether the drag produced a
+    /// rectangle above the minimum threshold. When no transcript is
+    /// queued, this is a silent no-op.
+    private func dispatchPendingTranscriptIfAny() {
+        guard let queuedTranscript = pendingTranscriptAwaitingDragCompletion else { return }
+        pendingTranscriptAwaitingDragCompletion = nil
+        print("🗣️ Releasing queued transcript after focus-rectangle drag completion")
+        sendTranscriptToClaudeWithScreenshot(transcript: queuedTranscript)
+    }
+
     /// Captures a screenshot, sends it along with the transcript to Claude,
     /// and plays the response aloud via ElevenLabs TTS. The cursor stays in
     /// the spinner/processing state until TTS audio begins playing.
@@ -1057,8 +1150,46 @@ final class CompanionManager: NSObject, ObservableObject, NSSpeechSynthesizerDel
             voiceState = .processing
 
             do {
-                // Capture all connected screens so the AI has full context
-                let screenCaptures = try await CompanionScreenCaptureUtility.captureAllScreensAsJPEG()
+                // Snapshot the user's most recent focus rectangle (if any) so
+                // the same value flows into BOTH the compositor (which stamps
+                // a bright yellow border onto the matching display's JPEG)
+                // and the image-label hint (which tells Claude to focus its
+                // analysis on the bordered region). A snapshot keeps the two
+                // sites consistent even if the manager's published value
+                // changes between the capture call and the label build.
+                let focusRectangleForThisTurn = focusRectangleDrawingOverlayManager.currentFocusRectangle
+
+                // Resolve which screen to send. We deliberately send only ONE
+                // display instead of a composite of every connected monitor:
+                //   (a) Claude doesn't have to guess which screen the user
+                //       means — on a laptop + external display setup, the
+                //       composite was frequently confusing.
+                //   (b) Half the token spend, noticeably faster responses.
+                // Priority: the focus rectangle's display if one was drawn
+                // (the user explicitly pointed at it), else the display
+                // containing the mouse cursor right now. If neither resolves
+                // we pass nil and the capture utility captures everything,
+                // which is the pre-change fallback behavior.
+                let targetDisplayIDForThisTurn: CGDirectDisplayID? = {
+                    if let focusRectangleForThisTurn {
+                        return focusRectangleForThisTurn.displayID
+                    }
+                    let currentMouseLocationInAppKitGlobalCoordinates = NSEvent.mouseLocation
+                    for candidateScreen in NSScreen.screens {
+                        guard candidateScreen.frame.contains(currentMouseLocationInAppKitGlobalCoordinates) else { continue }
+                        if let candidateDisplayID = candidateScreen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? CGDirectDisplayID {
+                            return candidateDisplayID
+                        }
+                    }
+                    return nil
+                }()
+
+                // Capture the chosen screen (or every screen, if neither the
+                // focus rectangle nor the cursor resolved to a known display)
+                let screenCaptures = try await CompanionScreenCaptureUtility.captureAllScreensAsJPEG(
+                    highlightFocusRectangle: focusRectangleForThisTurn,
+                    restrictToDisplayID: targetDisplayIDForThisTurn
+                )
                 print("🖼️ Companion captured \(screenCaptures.count) screen(s) for Claude")
 
                 guard !Task.isCancelled else { return }
@@ -1066,9 +1197,18 @@ final class CompanionManager: NSObject, ObservableObject, NSSpeechSynthesizerDel
                 // Build image labels with the actual screenshot pixel dimensions
                 // so Claude's coordinate space matches the image it sees. We
                 // scale from screenshot pixels to display points ourselves.
-                let labeledImages = screenCaptures.map { capture in
-                let dimensionInfo = " (image dimensions: \(capture.screenshotWidthInPixels)x\(capture.screenshotHeightInPixels) pixels)"
-                    return (data: capture.imageData, label: capture.label + dimensionInfo)
+                // If the user drew a focus rectangle during the hold, append a
+                // short hint to the label of the matching display so the text
+                // side of the prompt reinforces what the visual side already
+                // shows (a bright yellow border around the region of interest).
+                let labeledImages = screenCaptures.map { capture -> (data: Data, label: String) in
+                    let dimensionInfo = " (image dimensions: \(capture.screenshotWidthInPixels)x\(capture.screenshotHeightInPixels) pixels)"
+                    var focusRectangleHint = ""
+                    if let focusRectangleForThisTurn,
+                       focusRectangleForThisTurn.displayID == capture.displayID {
+                        focusRectangleHint = " The user has drawn a bright yellow rectangle on this screen to highlight the specific region they're asking about. Focus your analysis on the content inside that rectangle, but use the surrounding context if needed."
+                    }
+                    return (data: capture.imageData, label: capture.label + dimensionInfo + focusRectangleHint)
                 }
 
                 let actionIntent = await classifyActionIntent(
@@ -1218,6 +1358,11 @@ final class CompanionManager: NSObject, ObservableObject, NSSpeechSynthesizerDel
 
             if !Task.isCancelled {
                 voiceState = .idle
+                // Clear the drawn focus rectangle now that the compositor and
+                // Claude have both consumed it. The next push-to-talk press
+                // starts with a clean slate — a fresh drag (or no drag) from
+                // the user decides the next turn independently.
+                focusRectangleDrawingOverlayManager.resetFocusRectangle()
                 scheduleTransientHideIfNeeded()
             }
         }
