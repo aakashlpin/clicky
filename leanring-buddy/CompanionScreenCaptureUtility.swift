@@ -180,6 +180,37 @@ enum CompanionScreenCaptureUtility {
         return capturedScreens
     }
 
+    /// Persists the provided captures to a caller-specified Application Support
+    /// subdirectory and returns the written file URLs in the same order.
+    static func persistCapturesToDisk(
+        _ captures: [CompanionScreenCapture],
+        intoSubdirectoryNamed subdirectoryName: String
+    ) throws -> [URL] {
+        let applicationSupportDirectoryURL = try requiredApplicationSupportDirectoryURL()
+        let capturesDirectoryURL = applicationSupportDirectoryURL
+            .appendingPathComponent("Flowee/Multica Attachments", isDirectory: true)
+            .appendingPathComponent(subdirectoryName, isDirectory: true)
+
+        try FileManager.default.createDirectory(
+            at: capturesDirectoryURL,
+            withIntermediateDirectories: true,
+            attributes: nil
+        )
+
+        var persistedCaptureFileURLs: [URL] = []
+        persistedCaptureFileURLs.reserveCapacity(captures.count)
+
+        for (captureIndex, capture) in captures.enumerated() {
+            let captureFilenameSlug = sanitizedCaptureFilenameSlug(from: capture.label)
+            let captureFilename = "screen-\(String(format: "%02d", captureIndex))-\(captureFilenameSlug).jpg"
+            let captureFileURL = capturesDirectoryURL.appendingPathComponent(captureFilename, isDirectory: false)
+            try capture.imageData.write(to: captureFileURL)
+            persistedCaptureFileURLs.append(captureFileURL)
+        }
+
+        return persistedCaptureFileURLs
+    }
+
     /// Stamps a warm-yellow border for the user's focus rectangle onto the captured
     /// JPEG for a single display. The input rect is in AppKit display-local points
     /// (bottom-left origin, matching NSEvent.mouseLocation); the output is re-encoded
@@ -330,5 +361,36 @@ enum CompanionScreenCaptureUtility {
         }
 
         return jpegDestinationData as Data
+    }
+
+    private static func requiredApplicationSupportDirectoryURL() throws -> URL {
+        guard let applicationSupportDirectoryURL = FileManager.default.urls(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask
+        ).first else {
+            throw NSError(
+                domain: "CompanionScreenCapture",
+                code: -3,
+                userInfo: [NSLocalizedDescriptionKey: "Application Support directory is unavailable"]
+            )
+        }
+
+        return applicationSupportDirectoryURL
+    }
+
+    private static func sanitizedCaptureFilenameSlug(from captureLabel: String) -> String {
+        let lowercaseCaptureLabel = captureLabel.lowercased()
+        let nonAlphanumericCharacters = CharacterSet.alphanumerics.inverted
+        let slugComponents = lowercaseCaptureLabel
+            .components(separatedBy: nonAlphanumericCharacters)
+            .filter { !$0.isEmpty }
+        let joinedSlug = slugComponents.joined(separator: "-")
+        let trimmedSlug = joinedSlug.trimmingCharacters(in: CharacterSet(charactersIn: "-"))
+
+        if trimmedSlug.isEmpty {
+            return "capture"
+        }
+
+        return String(trimmedSlug.prefix(40))
     }
 }
