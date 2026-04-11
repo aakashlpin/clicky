@@ -22,6 +22,22 @@ enum CompanionVoiceState {
     case responding
 }
 
+private func loadStoredDelegationRoutingPreference() -> DelegationTarget {
+    let userDefaults = UserDefaults.standard
+    let storedDelegationTargetKind = userDefaults.string(forKey: "ClickyDelegationTargetKind")
+
+    switch storedDelegationTargetKind {
+    case "multica":
+        let storedMulticaAgentName = userDefaults.string(forKey: "ClickyMulticaDefaultAgentName")?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !storedMulticaAgentName.isEmpty else {
+            return .localWorkspace
+        }
+        return .multica(assigneeAgentName: storedMulticaAgentName)
+    default:
+        return .localWorkspace
+    }
+}
+
 @MainActor
 final class CompanionManager: NSObject, ObservableObject, NSSpeechSynthesizerDelegate {
     @Published private(set) var voiceState: CompanionVoiceState = .idle
@@ -74,6 +90,7 @@ final class CompanionManager: NSObject, ObservableObject, NSSpeechSynthesizerDel
     let delegationLogSidebarManager = DelegationLogSidebarManager()
     let workspaceInventoryStore = WorkspaceInventoryStore()
     let delegationAgentRuntimeRegistry = DelegationAgentRuntimeRegistry()
+    @Published private(set) var multicaAgentRegistry = MulticaAgentRegistry()
     @Published private(set) var currentActionIntent: ClickyActionIntent = .reply
     @Published private(set) var isAwaitingDelegationWorkspaceSelection = false
     @Published private(set) var pendingDelegationRequest: ClickyDelegationRequest?
@@ -148,6 +165,8 @@ final class CompanionManager: NSObject, ObservableObject, NSSpeechSynthesizerDel
     private var latestGeneratedMarkdownTranscriptText: String?
     private(set) var pendingDelegationScreenCaptures: [CompanionScreenCapture] = []
     private let delegationAgentLauncher = DelegationAgentLauncher()
+    private let multicaIssueLauncher = MulticaIssueLauncher()
+    private let multicaIssueContentGenerator = MulticaIssueContentGenerator()
 
     /// A delegation that has been accepted by Flowee and sits in a
     /// per-workspace FIFO queue waiting to be launched. The matching
@@ -186,9 +205,7 @@ final class CompanionManager: NSObject, ObservableObject, NSSpeechSynthesizerDel
     /// The Claude model used for voice responses. Persisted to UserDefaults.
     @Published var selectedModel: String = UserDefaults.standard.string(forKey: "selectedClaudeModel") ?? "claude-sonnet-4-6"
 
-    @Published var currentDelegationRoutingPreference: DelegationTarget = UserDefaults.standard.string(forKey: "ClickyDelegationTargetKind")
-        .flatMap(DelegationTarget.init(rawValue:))
-        ?? .localWorkspace
+    @Published var currentDelegationRoutingPreference: DelegationTarget = loadStoredDelegationRoutingPreference()
 
     func setSelectedModel(_ model: String) {
         selectedModel = model
@@ -198,7 +215,13 @@ final class CompanionManager: NSObject, ObservableObject, NSSpeechSynthesizerDel
 
     func updateDelegationRoutingPreference(_ newPreference: DelegationTarget) {
         currentDelegationRoutingPreference = newPreference
-        UserDefaults.standard.set(newPreference.rawValue, forKey: "ClickyDelegationTargetKind")
+        switch newPreference {
+        case .localWorkspace:
+            UserDefaults.standard.set("localWorkspace", forKey: "ClickyDelegationTargetKind")
+        case let .multica(assigneeAgentName):
+            UserDefaults.standard.set("multica", forKey: "ClickyDelegationTargetKind")
+            UserDefaults.standard.set(assigneeAgentName, forKey: "ClickyMulticaDefaultAgentName")
+        }
     }
 
     /// User preference for whether the Clicky cursor should be shown.
@@ -297,6 +320,9 @@ final class CompanionManager: NSObject, ObservableObject, NSSpeechSynthesizerDel
         _ = claudeAPI
         Task {
             await buddyDictationManager.prewarmTranscriptionProviderIfNeeded()
+        }
+        Task {
+            await multicaAgentRegistry.refreshAvailableAgents()
         }
 
         // If the user already completed onboarding AND all permissions are
@@ -1381,6 +1407,18 @@ final class CompanionManager: NSObject, ObservableObject, NSSpeechSynthesizerDel
         transcript: String,
         screenCaptures: [CompanionScreenCapture]
     ) {
+        switch currentDelegationRoutingPreference {
+        case .localWorkspace:
+            break
+        case let .multica(assigneeAgentName):
+            routeDelegationToMulticaIssueFiling(
+                transcript: transcript,
+                screenCaptures: screenCaptures,
+                assigneeAgentName: assigneeAgentName
+            )
+            return
+        }
+
         delegationAgentRuntimeRegistry.refreshInstalledRuntimes()
         let allowedWorkspaces = workspaceInventoryStore.enabledWorkspaces
         guard !allowedWorkspaces.isEmpty else {
@@ -1435,6 +1473,78 @@ final class CompanionManager: NSObject, ObservableObject, NSSpeechSynthesizerDel
             }
         )
         print("🧭 Delegation intent resolved — awaiting workspace selection")
+    }
+
+    private func routeDelegationToMulticaIssueFiling(
+        transcript: String,
+        screenCaptures: [CompanionScreenCapture],
+        assigneeAgentName: String
+    ) {
+        pendingDelegationScreenCaptures = []
+        pendingDelegationRequest = nil
+        isAwaitingDelegationWorkspaceSelection = false
+        selectedDelegationWorkspace = nil
+        selectedDelegationRuntimeID = nil
+
+        Task { [weak self] in
+            guard let self else { return }
+
+            let multicaIssueContent = await self.multicaIssueContentGenerator.generateIssueContent(
+                transcript: transcript,
+                screenSummary: screenCaptures.map(\.label).joined(separator: " | "),
+                workspaceName: nil
+            )
+
+            let subdirectoryName = Self.makeMulticaAttachmentsSubdirectoryName(
+                fromTitle: multicaIssueContent.title
+            )
+            let attachmentFileURLs = (try? await CompanionScreenCaptureUtility.persistCapturesToDisk(
+                screenCaptures,
+                intoSubdirectoryNamed: subdirectoryName
+            )) ?? []
+
+            let multicaIssueCreationRequest = MulticaIssueCreationRequest(
+                title: multicaIssueContent.title,
+                description: multicaIssueContent.description,
+                attachmentFilePaths: attachmentFileURLs,
+                assigneeAgentName: assigneeAgentName,
+                priority: nil
+            )
+
+            do {
+                let multicaIssueCreationResult = try await self.multicaIssueLauncher.createIssue(
+                    multicaIssueCreationRequest
+                )
+
+                print("🧭 Multica issue filed: \(multicaIssueCreationResult.issueIdentifier) — \(multicaIssueCreationResult.issueTitle)")
+
+                await MainActor.run {
+                    self.companionResponseOverlayManager.showMulticaIssueFiledChip(
+                        issueIdentifier: multicaIssueCreationResult.issueIdentifier,
+                        assigneeAgentName: multicaIssueCreationResult.assignedAgentName
+                    )
+                }
+            } catch {
+                print("⚠️ Multica issue filing failed: \(error)")
+            }
+        }
+    }
+
+    private static func makeMulticaAttachmentsSubdirectoryName(fromTitle title: String) -> String {
+        let lowercasedTitle = title.lowercased()
+        let allowedCharacterSet = CharacterSet.lowercaseLetters
+            .union(.decimalDigits)
+            .union(CharacterSet(charactersIn: "-_"))
+        let slugifiedScalars = lowercasedTitle.unicodeScalars.map { scalar -> Character in
+            allowedCharacterSet.contains(scalar) ? Character(scalar) : "-"
+        }
+        let rawSlug = String(slugifiedScalars).trimmingCharacters(in: CharacterSet(charactersIn: "-"))
+        let truncatedSlug = String(rawSlug.prefix(60))
+        let timestampSuffix = String(Int(Date().timeIntervalSince1970))
+        let combinedName = truncatedSlug.isEmpty
+            ? "multica-issue-\(timestampSuffix)"
+            : "\(truncatedSlug)-\(timestampSuffix)"
+        return combinedName
     }
 
     func cancelPendingDelegationFlow() {
