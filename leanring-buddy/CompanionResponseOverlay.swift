@@ -19,11 +19,13 @@ final class CompanionResponseOverlayViewModel: ObservableObject {
         case readyToCopy
         case copied
         case failed
+        case multicaIssueFiled
     }
 
     @Published var markdownTranscriptStatus: MarkdownTranscriptStatus = .hidden
     @Published var statusTitleText: String = ""
     @Published var statusDetailText: String = ""
+    @Published var usesCompactSingleLineLayout: Bool = false
 }
 
 @MainActor
@@ -35,7 +37,8 @@ final class CompanionResponseOverlayManager {
 
     private let cursorOffsetX: CGFloat = 20
     private let cursorOffsetY: CGFloat = 4
-    private let overlayWidth: CGFloat = 190
+    private let markdownTranscriptOverlaySize = CGSize(width: 190, height: 54)
+    private let multicaIssueFiledOverlaySize = CGSize(width: 280, height: 36)
 
     func showGeneratingMarkdownTranscriptStatus() {
         autoHideWorkItem?.cancel()
@@ -43,6 +46,7 @@ final class CompanionResponseOverlayManager {
         overlayViewModel.markdownTranscriptStatus = .generating
         overlayViewModel.statusTitleText = "Creating transcript"
         overlayViewModel.statusDetailText = "Reading screenshot..."
+        overlayViewModel.usesCompactSingleLineLayout = false
         showOverlay()
     }
 
@@ -52,6 +56,7 @@ final class CompanionResponseOverlayManager {
         overlayViewModel.markdownTranscriptStatus = .readyToCopy
         overlayViewModel.statusTitleText = "Transcript ready"
         overlayViewModel.statusDetailText = "Press ^⌥C to copy"
+        overlayViewModel.usesCompactSingleLineLayout = false
         showOverlay()
     }
 
@@ -59,6 +64,7 @@ final class CompanionResponseOverlayManager {
         overlayViewModel.markdownTranscriptStatus = .copied
         overlayViewModel.statusTitleText = "Transcript copied"
         overlayViewModel.statusDetailText = "Markdown copied to clipboard"
+        overlayViewModel.usesCompactSingleLineLayout = false
         showOverlay()
 
         let hideWorkItem = DispatchWorkItem { [weak self] in
@@ -74,6 +80,7 @@ final class CompanionResponseOverlayManager {
         overlayViewModel.markdownTranscriptStatus = .failed
         overlayViewModel.statusTitleText = "Transcript failed"
         overlayViewModel.statusDetailText = "Try again"
+        overlayViewModel.usesCompactSingleLineLayout = false
         showOverlay()
 
         let hideWorkItem = DispatchWorkItem { [weak self] in
@@ -83,20 +90,36 @@ final class CompanionResponseOverlayManager {
         DispatchQueue.main.asyncAfter(deadline: .now() + 2.0, execute: hideWorkItem)
     }
 
-    func hideMarkdownTranscriptOverlay() {
+    func showMulticaIssueFiledChip(issueIdentifier: String, assigneeAgentName: String) {
         autoHideWorkItem?.cancel()
-        autoHideWorkItem = nil
-        stopCursorTracking()
-        overlayViewModel.markdownTranscriptStatus = .hidden
-        overlayViewModel.statusTitleText = ""
+        overlayViewModel.markdownTranscriptStatus = .multicaIssueFiled
+        overlayViewModel.statusTitleText = "Filed \(issueIdentifier) → \(assigneeAgentName)"
         overlayViewModel.statusDetailText = ""
-        overlayPanel?.orderOut(nil)
+        overlayViewModel.usesCompactSingleLineLayout = true
+        showOverlay(fadesIn: true)
+
+        let hideWorkItem = DispatchWorkItem { [weak self] in
+            self?.hideOverlay(fadesOut: true)
+        }
+        autoHideWorkItem = hideWorkItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3.0, execute: hideWorkItem)
     }
 
-    private func showOverlay() {
+    func hideMarkdownTranscriptOverlay() {
+        hideOverlay()
+    }
+
+    private func showOverlay(fadesIn: Bool = false) {
         createOverlayPanelIfNeeded()
+        updateOverlayPanelSize()
         startCursorTracking()
-        overlayPanel?.alphaValue = 1
+        if fadesIn {
+            overlayPanel?.alphaValue = 0
+            overlayPanel?.orderFrontRegardless()
+            animateOverlayAlpha(to: 1, duration: DS.Animation.normal)
+        } else {
+            overlayPanel?.alphaValue = 1
+        }
         overlayPanel?.orderFrontRegardless()
         repositionPanelNearCursor()
     }
@@ -104,7 +127,7 @@ final class CompanionResponseOverlayManager {
     private func createOverlayPanelIfNeeded() {
         if overlayPanel != nil { return }
 
-        let initialFrame = NSRect(x: 0, y: 0, width: overlayWidth, height: 54)
+        let initialFrame = NSRect(origin: .zero, size: markdownTranscriptOverlaySize)
         let responseOverlayPanel = NSPanel(
             contentRect: initialFrame,
             styleMask: [.borderless, .nonactivatingPanel],
@@ -130,6 +153,15 @@ final class CompanionResponseOverlayManager {
         overlayPanel = responseOverlayPanel
     }
 
+    private func updateOverlayPanelSize() {
+        guard let overlayPanel, let hostingView = overlayPanel.contentView else { return }
+
+        let overlaySize = currentOverlaySize
+        let overlayFrame = NSRect(origin: overlayPanel.frame.origin, size: overlaySize)
+        overlayPanel.setFrame(overlayFrame, display: true)
+        hostingView.frame = NSRect(origin: .zero, size: overlaySize)
+    }
+
     private func startCursorTracking() {
         stopCursorTracking()
         cursorTrackingTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
@@ -142,6 +174,56 @@ final class CompanionResponseOverlayManager {
     private func stopCursorTracking() {
         cursorTrackingTimer?.invalidate()
         cursorTrackingTimer = nil
+    }
+
+    private func hideOverlay(fadesOut: Bool = false) {
+        autoHideWorkItem?.cancel()
+        autoHideWorkItem = nil
+
+        guard let overlayPanel else {
+            resetOverlayState()
+            return
+        }
+
+        if fadesOut {
+            animateOverlayAlpha(to: 0, duration: DS.Animation.normal) { [weak self] in
+                guard let self else { return }
+                self.stopCursorTracking()
+                overlayPanel.orderOut(nil)
+                self.resetOverlayState()
+            }
+            return
+        }
+
+        stopCursorTracking()
+        overlayPanel.orderOut(nil)
+        resetOverlayState()
+    }
+
+    private func animateOverlayAlpha(to alphaValue: CGFloat, duration: Double, completion: (() -> Void)? = nil) {
+        guard let overlayPanel else {
+            completion?()
+            return
+        }
+
+        NSAnimationContext.runAnimationGroup { animationContext in
+            animationContext.duration = duration
+            animationContext.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+            overlayPanel.animator().alphaValue = alphaValue
+        } completionHandler: {
+            completion?()
+        }
+    }
+
+    private func resetOverlayState() {
+        overlayViewModel.markdownTranscriptStatus = .hidden
+        overlayViewModel.statusTitleText = ""
+        overlayViewModel.statusDetailText = ""
+        overlayViewModel.usesCompactSingleLineLayout = false
+    }
+
+    private var currentOverlaySize: CGSize {
+        overlayViewModel.usesCompactSingleLineLayout ? multicaIssueFiledOverlaySize : markdownTranscriptOverlaySize
     }
 
     private func repositionPanelNearCursor() {
@@ -177,26 +259,38 @@ private struct CompanionResponseOverlayView: View {
 
     var body: some View {
         if viewModel.markdownTranscriptStatus != .hidden {
-            VStack(alignment: .leading, spacing: 2) {
-                Text(viewModel.statusTitleText)
-                    .font(.system(size: 11, weight: .semibold))
-                    .foregroundColor(DS.Colors.textPrimary)
+            Group {
+                if viewModel.usesCompactSingleLineLayout {
+                    Text(viewModel.statusTitleText)
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundColor(DS.Colors.textPrimary)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                } else {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(viewModel.statusTitleText)
+                            .font(.system(size: 11, weight: .semibold))
+                            .foregroundColor(DS.Colors.textPrimary)
 
-                Text(viewModel.statusDetailText)
-                    .font(.system(size: 10, weight: .regular))
-                    .foregroundColor(DS.Colors.textTertiary)
+                        Text(viewModel.statusDetailText)
+                            .font(.system(size: 10, weight: .regular))
+                            .foregroundColor(DS.Colors.textTertiary)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
             }
-            .frame(width: 190, alignment: .leading)
             .padding(.horizontal, 10)
-            .padding(.vertical, 8)
+            .padding(.vertical, viewModel.usesCompactSingleLineLayout ? 7 : 8)
             .background(
-                RoundedRectangle(cornerRadius: 9, style: .continuous)
+                RoundedRectangle(cornerRadius: DS.CornerRadius.large, style: .continuous)
                     .fill(DS.Colors.surface1.opacity(0.96))
                     .overlay(
-                        RoundedRectangle(cornerRadius: 9, style: .continuous)
+                        RoundedRectangle(cornerRadius: DS.CornerRadius.large, style: .continuous)
                             .stroke(DS.Colors.borderSubtle.opacity(0.45), lineWidth: 0.8)
                     )
             )
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
         }
     }
 }
