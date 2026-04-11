@@ -18,6 +18,28 @@ enum DelegationTarget: Equatable {
     case multica(assigneeAgentName: String)
 }
 
+extension DelegationTarget {
+    var isMulticaTarget: Bool {
+        if case .multica = self { return true }
+        return false
+    }
+
+    var displayLabel: String {
+        switch self {
+        case .localWorkspace: return "Local workspace"
+        case .multica: return "Multica"
+        }
+    }
+
+    func hasSameKind(as otherDelegationTarget: DelegationTarget) -> Bool {
+        switch (self, otherDelegationTarget) {
+        case (.localWorkspace, .localWorkspace): return true
+        case (.multica, .multica): return true
+        default: return false
+        }
+    }
+}
+
 struct ClickyDelegationRequest: Identifiable, Equatable {
     let id: UUID
     let transcript: String

@@ -14,9 +14,15 @@ import SwiftUI
 struct CompanionPanelView: View {
     @ObservedObject var companionManager: CompanionManager
     @State private var emailInput: String = ""
-    @State private var selectedDelegationTarget: DelegationTarget = UserDefaults.standard.string(forKey: "ClickyDelegationTargetKind")
-        .flatMap(DelegationTarget.init(rawValue:))
-        ?? .localWorkspace
+    @State private var selectedDelegationTarget: DelegationTarget = {
+        let storedKind = UserDefaults.standard.string(forKey: "ClickyDelegationTargetKind")
+        let storedAgentName = UserDefaults.standard.string(forKey: "ClickyMulticaDefaultAgentName")?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if storedKind == "multica" && !storedAgentName.isEmpty {
+            return .multica(assigneeAgentName: storedAgentName)
+        }
+        return .localWorkspace
+    }()
     @State private var selectedMulticaDefaultAgentName: String = UserDefaults.standard.string(forKey: "ClickyMulticaDefaultAgentName") ?? ""
 
     var body: some View {
@@ -680,7 +686,7 @@ struct CompanionPanelView: View {
 
             HStack(spacing: DS.Spacing.xs) {
                 delegationTargetOptionButton(for: .localWorkspace)
-                delegationTargetOptionButton(for: .multica)
+                delegationTargetOptionButton(for: .multica(assigneeAgentName: selectedMulticaDefaultAgentName))
             }
             .padding(DS.Spacing.xs)
             .background(
@@ -692,7 +698,7 @@ struct CompanionPanelView: View {
                     .stroke(DS.Colors.borderSubtle, lineWidth: 0.5)
             )
 
-            if selectedDelegationTarget == .multica {
+            if selectedDelegationTarget.isMulticaTarget {
                 VStack(alignment: .leading, spacing: DS.Spacing.xs) {
                     Text("Default agent")
                         .font(.system(size: 11, weight: .medium))
@@ -743,7 +749,7 @@ struct CompanionPanelView: View {
     }
 
     private func delegationTargetOptionButton(for delegationTarget: DelegationTarget) -> some View {
-        let isSelected = selectedDelegationTarget == delegationTarget
+        let isSelected = selectedDelegationTarget.hasSameKind(as: delegationTarget)
 
         return Button(action: {
             setSelectedDelegationTarget(delegationTarget)
@@ -801,9 +807,16 @@ struct CompanionPanelView: View {
     }
 
     private func reloadDelegationPreferencesFromUserDefaults() {
-        selectedDelegationTarget = UserDefaults.standard.string(forKey: "ClickyDelegationTargetKind")
-            .flatMap(DelegationTarget.init(rawValue:))
-            ?? companionManager.currentDelegationRoutingPreference
+        let storedKind = UserDefaults.standard.string(forKey: "ClickyDelegationTargetKind")
+        let storedAgentName = UserDefaults.standard.string(forKey: "ClickyMulticaDefaultAgentName")?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if storedKind == "multica" && !storedAgentName.isEmpty {
+            selectedDelegationTarget = .multica(assigneeAgentName: storedAgentName)
+        } else if storedKind == "localWorkspace" {
+            selectedDelegationTarget = .localWorkspace
+        } else {
+            selectedDelegationTarget = companionManager.currentDelegationRoutingPreference
+        }
         selectedMulticaDefaultAgentName = UserDefaults.standard.string(forKey: "ClickyMulticaDefaultAgentName") ?? ""
         companionManager.updateDelegationRoutingPreference(selectedDelegationTarget)
     }
