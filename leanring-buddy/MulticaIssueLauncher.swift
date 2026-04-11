@@ -212,7 +212,7 @@ final class MulticaIssueLauncher {
         )
     }
 
-    nonisolated private static func parseCreationResult(
+    nonisolated fileprivate static func parseCreationResult(
         from standardOutput: String,
         requestedAssigneeAgentName: String
     ) throws -> MulticaIssueCreationResult {
