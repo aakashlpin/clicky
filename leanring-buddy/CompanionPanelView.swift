@@ -13,6 +13,7 @@ import SwiftUI
 
 struct CompanionPanelView: View {
     @ObservedObject var companionManager: CompanionManager
+    @ObservedObject var multicaAgentRegistry: MulticaAgentRegistry
     @State private var emailInput: String = ""
     @State private var selectedDelegationTarget: DelegationTarget = {
         let storedKind = UserDefaults.standard.string(forKey: "ClickyDelegationTargetKind")
@@ -109,6 +110,9 @@ struct CompanionPanelView: View {
         .onAppear {
             reloadDelegationPreferencesFromUserDefaults()
             reconcileSelectedMulticaAgentName()
+        }
+        .task {
+            await multicaAgentRegistry.refreshAvailableAgents()
         }
         .onChange(of: multicaAvailableAgentNames) { _, _ in
             reconcileSelectedMulticaAgentName()
@@ -781,19 +785,7 @@ struct CompanionPanelView: View {
     }
 
     private var multicaAvailableAgentNames: [String] {
-        if let multicaAgentRegistry = Mirror(reflecting: companionManager).children.first(where: { $0.label == "multicaAgentRegistry" })?.value {
-            if let stubRegistry = multicaAgentRegistry as? MulticaAgentRegistry {
-                return stubRegistry.availableAgents.map(\.name)
-            }
-
-            if let availableAgentsValue = Mirror(reflecting: multicaAgentRegistry).children.first(where: { $0.label == "availableAgents" })?.value {
-                return Mirror(reflecting: availableAgentsValue).children.compactMap { availableAgentChild in
-                    Mirror(reflecting: availableAgentChild.value).children.first(where: { $0.label == "name" })?.value as? String
-                }
-            }
-        }
-
-        return []
+        multicaAgentRegistry.availableAgents.map(\.name)
     }
 
     private func setSelectedDelegationTarget(_ delegationTarget: DelegationTarget) {
