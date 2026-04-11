@@ -148,8 +148,11 @@ final class MenuBarPanelManager: NSObject {
     }
 
     private func createPanel() {
-        let companionPanelView = CompanionPanelView(companionManager: companionManager)
-            .frame(width: panelWidth)
+        let companionPanelView = CompanionPanelView(
+            companionManager: companionManager,
+            multicaAgentRegistry: companionManager.multicaAgentRegistry
+        )
+        .frame(width: panelWidth)
 
         let hostingView = NSHostingView(rootView: companionPanelView)
         hostingView.frame = NSRect(x: 0, y: 0, width: panelWidth, height: panelHeight)
