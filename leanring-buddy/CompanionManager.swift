@@ -137,6 +137,30 @@ final class CompanionManager: NSObject, ObservableObject, NSSpeechSynthesizerDel
     private(set) var pendingDelegationScreenCaptures: [CompanionScreenCapture] = []
     private let delegationAgentLauncher = DelegationAgentLauncher()
 
+    /// A delegation that has been accepted by Flowee and sits in a
+    /// per-workspace FIFO queue waiting to be launched. The matching
+    /// sidebar session already exists in the "queued" state — when
+    /// this entry is popped off the queue we promote that session
+    /// and call the launcher.
+    private struct EnqueuedDelegation {
+        let sidebarSessionID: UUID
+        let request: ClickyDelegationRequest
+        let workspace: WorkspaceInventoryStore.WorkspaceRecord
+        let runtime: InstalledDelegationAgentRuntime
+    }
+
+    /// One FIFO queue per workspace, keyed by workspace ID. Only the
+    /// entries after the first one are actually "waiting" — the head
+    /// of the queue (if any) is the one whose process is currently
+    /// running, mirrored by `activelyRunningDelegationSidebarSessionByWorkspaceID`.
+    private var delegationQueuesByWorkspaceID: [UUID: [EnqueuedDelegation]] = [:]
+
+    /// Maps a workspace ID to the sidebar session ID whose agent
+    /// process is currently running for that workspace. `nil` means
+    /// no delegation is running in that workspace right now (any
+    /// queued delegations will be promoted as soon as they arrive).
+    private var activelyRunningDelegationSidebarSessionByWorkspaceID: [UUID: UUID] = [:]
+
     /// True when all three required permissions (accessibility, screen recording,
     /// microphone) are granted. Used by the panel to show a single "all good" state.
     var allPermissionsGranted: Bool {
@@ -354,7 +378,7 @@ final class CompanionManager: NSObject, ObservableObject, NSSpeechSynthesizerDel
         buddyDictationManager.cancelCurrentDictation()
         companionResponseOverlayManager.hideMarkdownTranscriptOverlay()
         cancelPendingDelegationFlow()
-        delegationLogSidebarManager.hideStreamingLogSidebar()
+        delegationLogSidebarManager.hideAllSessions()
         overlayWindowManager.hideOverlay()
         transientHideTask?.cancel()
 
@@ -790,6 +814,47 @@ final class CompanionManager: NSObject, ObservableObject, NSSpeechSynthesizerDel
     {"intent":"reply|draft|delegate"}
     """
 
+    // System prompt for the semantic delegation branch-name generator.
+    // The goal is a branch name a human developer would be comfortable
+    // seeing in `git branch` and on GitHub — something like
+    // `feature/dark-mode-settings` or `fix/login-button-spacing` — rather
+    // than the mechanical `clicky-main-20260410-142153-9c33bd` smash the
+    // launcher used to produce. The launcher automatically prefixes the
+    // result with `flowee/` and handles disambiguation on collision, so
+    // this prompt should NOT include `flowee/` in its output.
+    private static let delegationBranchNameGenerationSystemPrompt = """
+    you generate a short git branch name body from a developer's spoken request.
+
+    rules:
+    - output format exactly: type/short-kebab-case-description
+    - type must be one of: feature, fix, chore, refactor, docs, test
+    - description is 2 to 5 words, lowercase, hyphen-separated
+    - total length between 8 and 60 characters
+    - never include dates, timestamps, uuids, random suffixes, or author names
+    - never include the word flowee or any namespace prefix
+    - no quotes, no punctuation, no explanations, no leading or trailing whitespace
+    - respond with only the branch name on a single line and nothing else
+
+    examples:
+    request: "fix the spacing issue on the login button"
+    fix/login-button-spacing
+
+    request: "add dark mode support to settings"
+    feature/settings-dark-mode
+
+    request: "remove all the unused imports in the api module"
+    chore/remove-unused-api-imports
+
+    request: "the api keeps timing out, figure out why and patch it"
+    fix/api-timeout-investigation
+
+    request: "refactor the auth flow to be async"
+    refactor/async-auth-flow
+
+    request: "document the delegation launcher architecture"
+    docs/delegation-launcher-architecture
+    """
+
     private static func shouldGenerateMarkdownTranscript(for transcript: String) -> Bool {
         let normalizedTranscript = transcript.lowercased()
         return markdownTranscriptRequestKeywords.contains { normalizedTranscript.contains($0) }
@@ -823,6 +888,55 @@ final class CompanionManager: NSObject, ObservableObject, NSSpeechSynthesizerDel
         } catch {
             print("⚠️ Intent classifier failed: \(error)")
             return .reply
+        }
+    }
+
+    /// Asks the lightweight classifier API to turn the user's spoken
+    /// delegation request into a short, human-readable branch name body
+    /// (e.g. `fix/login-button-spacing`). The result is passed to
+    /// `DelegationAgentLauncher` as a hint — the launcher is responsible
+    /// for adding the `flowee/` namespace prefix, validating the hint,
+    /// and retrying with a numeric suffix on collision. Returns nil on
+    /// any failure so the launcher cleanly falls back to its legacy
+    /// timestamp-based branch name instead of blocking the delegation.
+    private func generateSemanticBranchNameHint(
+        fromTranscript transcript: String
+    ) async -> String? {
+        let trimmedTranscript = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedTranscript.isEmpty else { return nil }
+
+        let branchNameGenerationUserPrompt = """
+        developer request:
+        \(trimmedTranscript)
+        """
+
+        do {
+            let (rawBranchNameResponse, _) = try await actionIntentClassifierAPI.analyzeImage(
+                images: [],
+                systemPrompt: Self.delegationBranchNameGenerationSystemPrompt,
+                userPrompt: branchNameGenerationUserPrompt
+            )
+
+            let cleanedBranchNameResponse = rawBranchNameResponse
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+
+            // The model should respond with a single line. If it stuffs
+            // an explanation on later lines, take only the first
+            // non-empty line — the launcher's sanitizer will handle the
+            // rest (character validation, length, collision retry).
+            let firstNonEmptyLine = cleanedBranchNameResponse
+                .split(whereSeparator: { $0.isNewline })
+                .map { $0.trimmingCharacters(in: .whitespaces) }
+                .first(where: { !$0.isEmpty })
+
+            print("🌿 Branch-name generator raw response: \(cleanedBranchNameResponse)")
+            if let firstNonEmptyLine, !firstNonEmptyLine.isEmpty {
+                return firstNonEmptyLine
+            }
+            return nil
+        } catch {
+            print("⚠️ Branch-name generator failed: \(error)")
+            return nil
         }
     }
 
@@ -1122,7 +1236,10 @@ final class CompanionManager: NSObject, ObservableObject, NSSpeechSynthesizerDel
             isAwaitingDelegationWorkspaceSelection = false
             selectedDelegationWorkspace = nil
             selectedDelegationRuntimeID = nil
-            speakErrorFallback("I don't have any allowed workspaces yet. Add one from the Flowee menu first.")
+            // Delegate mode is fully silent — no voice narration. The user will
+            // see nothing happen and can check the Flowee menu for the empty
+            // workspace inventory.
+            print("🧭 Delegation aborted: no allowed workspaces configured")
             return
         }
 
@@ -1134,7 +1251,9 @@ final class CompanionManager: NSObject, ObservableObject, NSSpeechSynthesizerDel
             isAwaitingDelegationWorkspaceSelection = false
             selectedDelegationWorkspace = nil
             selectedDelegationRuntimeID = nil
-            speakErrorFallback("I couldn't find any supported coding agents on this machine. Install Codex, Claude Code, or OpenCode first.")
+            // Delegate mode is fully silent — no voice narration on the
+            // missing-runtime error path either.
+            print("🧭 Delegation aborted: no supported coding-agent CLIs detected on this machine")
             return
         }
 
@@ -1208,42 +1327,189 @@ final class CompanionManager: NSObject, ObservableObject, NSSpeechSynthesizerDel
         workspace: WorkspaceInventoryStore.WorkspaceRecord,
         runtime: InstalledDelegationAgentRuntime
     ) {
-        let launchPrompt = buildDelegatedAgentPrompt(
-            request: request,
-            workspace: workspace
+        // Clicky serializes delegations per workspace: at most one
+        // agent can run in any given workspace at a time. The agent
+        // runs directly in the user's workspace (not a git worktree)
+        // so their dev server / editor can hot-reload the agent's
+        // edits as they land. If a previous delegation is still
+        // running in this workspace, the new one joins that
+        // workspace's FIFO queue and the sidebar immediately shows
+        // a "queued" panel so the user knows it was accepted.
+
+        let workspaceAlreadyHasRunningDelegation =
+            activelyRunningDelegationSidebarSessionByWorkspaceID[workspace.id] != nil
+        let queueLengthAheadOfThisOne =
+            (delegationQueuesByWorkspaceID[workspace.id]?.count ?? 0)
+                + (workspaceAlreadyHasRunningDelegation ? 1 : 0)
+
+        let initialQueuePositionText: String
+        if queueLengthAheadOfThisOne == 0 {
+            initialQueuePositionText = "picking up now"
+        } else if queueLengthAheadOfThisOne == 1 {
+            initialQueuePositionText = "next up · 1 delegation ahead"
+        } else {
+            initialQueuePositionText = "waiting · \(queueLengthAheadOfThisOne) delegations ahead"
+        }
+
+        let sidebarSessionID = delegationLogSidebarManager.createQueuedSession(
+            workspaceName: workspace.name,
+            workspacePath: workspace.path,
+            workspaceID: workspace.id,
+            runtimeID: runtime.runtimeID,
+            runtimeDisplayName: runtime.displayName,
+            userTranscriptPreview: request.transcript,
+            initialQueuePositionText: initialQueuePositionText
         )
 
-        Task {
-            do {
-                let launchResult = try await delegationAgentLauncher.launch(
-                    configuration: DelegationAgentLaunchConfiguration(
-                        workspacePath: workspace.path,
-                        prompt: launchPrompt,
-                        runtime: runtime,
-                        modelIdentifier: nil
-                    )
-                )
-                try? workspaceInventoryStore.markLastUsedDelegationRuntime(
-                    workspaceID: workspace.id,
-                    runtimeID: runtime.runtimeID
-                )
-                print("🧭 Delegation started in \(workspace.name) with \(launchResult.runtimeDisplayName), PID \(launchResult.processIdentifier)")
-                print("🧭 Delegation log: \(launchResult.logFileURL.path)")
-                delegationLogSidebarManager.showStreamingLogSidebar(
-                    logFileURL: launchResult.logFileURL,
-                    workspaceName: workspace.name,
-                    runtimeDisplayName: launchResult.runtimeDisplayName,
-                    processIdentifier: launchResult.processIdentifier,
-                    baseBranchName: launchResult.baseBranchName,
-                    workingBranchName: launchResult.workingBranchName,
-                    comparePullRequestURL: launchResult.comparePullRequestURL
-                )
-                speakErrorFallback("\(launchResult.runtimeDisplayName.lowercased()) is starting in \(workspace.name) on a new branch named \(launchResult.workingBranchName). when it finishes, i'll suggest raising a pull request into \(launchResult.baseBranchName).")
-            } catch {
-                print("⚠️ Delegation launch failed: \(error)")
-                speakErrorFallback("I couldn't start \(runtime.displayName) in that workspace. Please check the console and try again.")
+        let enqueuedDelegation = EnqueuedDelegation(
+            sidebarSessionID: sidebarSessionID,
+            request: request,
+            workspace: workspace,
+            runtime: runtime
+        )
+
+        if workspaceAlreadyHasRunningDelegation {
+            // Join the back of the queue — this one will be picked
+            // up when the previous delegation for this workspace
+            // exits.
+            delegationQueuesByWorkspaceID[workspace.id, default: []].append(enqueuedDelegation)
+            print("🧭 Delegation for \(workspace.name) enqueued at position \(queueLengthAheadOfThisOne) (behind a running agent)")
+            refreshQueuePositionTextForRemainingEntries(inWorkspaceID: workspace.id)
+        } else {
+            // Nothing running — pick up immediately.
+            activelyRunningDelegationSidebarSessionByWorkspaceID[workspace.id] = sidebarSessionID
+            print("🧭 Delegation for \(workspace.name) picked up immediately (empty queue)")
+            Task { await actuallyStartDelegatedAgent(enqueuedDelegation) }
+        }
+
+        cancelPendingDelegationFlow()
+    }
+
+    /// Does the real work of generating a branch-name hint, calling
+    /// the launcher, and promoting the queued sidebar session to
+    /// running. Called both for the immediate-start path and for
+    /// queue-advance pickups after a previous delegation exits.
+    private func actuallyStartDelegatedAgent(
+        _ enqueuedDelegation: EnqueuedDelegation
+    ) async {
+        let launchPrompt = buildDelegatedAgentPrompt(
+            request: enqueuedDelegation.request,
+            workspace: enqueuedDelegation.workspace
+        )
+
+        do {
+            // Ask the lightweight classifier to turn the user's
+            // spoken request into a developer-friendly branch name
+            // (e.g. `feature/dark-mode-settings`) before we cut the
+            // actual git branch. This is best-effort — on failure we
+            // pass nil and the launcher falls back to its legacy
+            // timestamp-based branch name.
+            let semanticBranchNameHint = await generateSemanticBranchNameHint(
+                fromTranscript: enqueuedDelegation.request.transcript
+            )
+            if let semanticBranchNameHint {
+                print("🌿 Semantic branch-name hint: \(semanticBranchNameHint)")
             }
-            cancelPendingDelegationFlow()
+
+            let launchResult = try await delegationAgentLauncher.launch(
+                configuration: DelegationAgentLaunchConfiguration(
+                    workspacePath: enqueuedDelegation.workspace.path,
+                    prompt: launchPrompt,
+                    runtime: enqueuedDelegation.runtime,
+                    modelIdentifier: nil,
+                    suggestedBranchNameHint: semanticBranchNameHint
+                )
+            )
+            try? workspaceInventoryStore.markLastUsedDelegationRuntime(
+                workspaceID: enqueuedDelegation.workspace.id,
+                runtimeID: enqueuedDelegation.runtime.runtimeID
+            )
+            print("🧭 Delegation started in \(enqueuedDelegation.workspace.name) with \(launchResult.runtimeDisplayName), PID \(launchResult.processIdentifier)")
+            print("🧭 Delegation log: \(launchResult.logFileURL.path)")
+
+            let capturedWorkspaceID = enqueuedDelegation.workspace.id
+            delegationLogSidebarManager.promoteQueuedSessionToRunning(
+                sessionID: enqueuedDelegation.sidebarSessionID,
+                logFileURL: launchResult.logFileURL,
+                processIdentifier: launchResult.processIdentifier,
+                baseBranchName: launchResult.baseBranchName,
+                workingBranchName: launchResult.workingBranchName,
+                comparePullRequestURL: launchResult.comparePullRequestURL,
+                onProcessCompleteCallback: { [weak self] in
+                    self?.advanceDelegationQueue(forWorkspaceID: capturedWorkspaceID)
+                }
+            )
+            // Delegate mode is fully silent — no voice narration. The
+            // delegation log sidebar is the only feedback surface
+            // while the coding agent works.
+        } catch {
+            print("⚠️ Delegation launch failed in \(enqueuedDelegation.workspace.name): \(error)")
+            // Surface the failure in the sidebar (the session was
+            // already created in queued state — transition it to
+            // failed state with the error message) so the user
+            // isn't left staring at a queued panel that never
+            // starts.
+            delegationLogSidebarManager.markQueuedSessionAsFailed(
+                sessionID: enqueuedDelegation.sidebarSessionID,
+                errorMessage: error.localizedDescription
+            )
+            // This slot in the queue is now free — advance so the
+            // next delegation in this workspace (if any) can take
+            // its turn.
+            advanceDelegationQueue(forWorkspaceID: enqueuedDelegation.workspace.id)
+        }
+    }
+
+    /// Called when the currently-running delegation in a given
+    /// workspace finishes (process exit). Pops the next queued
+    /// delegation from that workspace's FIFO and promotes it to
+    /// running; updates the visible queue-position text for every
+    /// delegation that's still waiting behind it.
+    private func advanceDelegationQueue(forWorkspaceID workspaceID: UUID) {
+        // Free the "currently running" slot for this workspace so the
+        // hasRunningDelegation check reads accurately.
+        activelyRunningDelegationSidebarSessionByWorkspaceID.removeValue(forKey: workspaceID)
+
+        var queueForWorkspace = delegationQueuesByWorkspaceID[workspaceID] ?? []
+        guard !queueForWorkspace.isEmpty else {
+            delegationQueuesByWorkspaceID[workspaceID] = nil
+            return
+        }
+
+        let nextEnqueuedDelegation = queueForWorkspace.removeFirst()
+        delegationQueuesByWorkspaceID[workspaceID] =
+            queueForWorkspace.isEmpty ? nil : queueForWorkspace
+
+        activelyRunningDelegationSidebarSessionByWorkspaceID[workspaceID] =
+            nextEnqueuedDelegation.sidebarSessionID
+
+        refreshQueuePositionTextForRemainingEntries(inWorkspaceID: workspaceID)
+
+        print("🧭 Delegation queue for \(nextEnqueuedDelegation.workspace.name) advanced: picking up next delegation")
+        Task { await actuallyStartDelegatedAgent(nextEnqueuedDelegation) }
+    }
+
+    /// Rewrites the user-visible queue-position text on every
+    /// delegation that is still sitting in the queue for a given
+    /// workspace, so the numbers stay accurate as the queue drains.
+    private func refreshQueuePositionTextForRemainingEntries(inWorkspaceID workspaceID: UUID) {
+        let queueForWorkspace = delegationQueuesByWorkspaceID[workspaceID] ?? []
+        for (queueIndex, enqueuedDelegation) in queueForWorkspace.enumerated() {
+            // queueIndex is 0-indexed within the waiting list; the
+            // head of the waiting list is 1 step behind the currently
+            // running delegation (position 1 in the user-visible
+            // string).
+            let positionAfterCurrentlyRunning = queueIndex + 1
+            let updatedPositionText: String
+            if positionAfterCurrentlyRunning == 1 {
+                updatedPositionText = "next up · 1 delegation ahead"
+            } else {
+                updatedPositionText = "waiting · \(positionAfterCurrentlyRunning) delegations ahead"
+            }
+            delegationLogSidebarManager.updateQueuePositionText(
+                sessionID: enqueuedDelegation.sidebarSessionID,
+                newQueuePositionText: updatedPositionText
+            )
         }
     }
 
