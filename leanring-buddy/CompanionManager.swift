@@ -186,10 +186,19 @@ final class CompanionManager: NSObject, ObservableObject, NSSpeechSynthesizerDel
     /// The Claude model used for voice responses. Persisted to UserDefaults.
     @Published var selectedModel: String = UserDefaults.standard.string(forKey: "selectedClaudeModel") ?? "claude-sonnet-4-6"
 
+    @Published var currentDelegationRoutingPreference: DelegationTarget = UserDefaults.standard.string(forKey: "ClickyDelegationTargetKind")
+        .flatMap(DelegationTarget.init(rawValue:))
+        ?? .localWorkspace
+
     func setSelectedModel(_ model: String) {
         selectedModel = model
         UserDefaults.standard.set(model, forKey: "selectedClaudeModel")
         claudeAPI.model = model
+    }
+
+    func updateDelegationRoutingPreference(_ newPreference: DelegationTarget) {
+        currentDelegationRoutingPreference = newPreference
+        UserDefaults.standard.set(newPreference.rawValue, forKey: "ClickyDelegationTargetKind")
     }
 
     /// User preference for whether the Clicky cursor should be shown.
