@@ -14,6 +14,10 @@ import SwiftUI
 struct CompanionPanelView: View {
     @ObservedObject var companionManager: CompanionManager
     @State private var emailInput: String = ""
+    @State private var selectedDelegationTarget: DelegationTarget = UserDefaults.standard.string(forKey: "ClickyDelegationTargetKind")
+        .flatMap(DelegationTarget.init(rawValue:))
+        ?? .localWorkspace
+    @State private var selectedMulticaDefaultAgentName: String = UserDefaults.standard.string(forKey: "ClickyMulticaDefaultAgentName") ?? ""
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -55,6 +59,22 @@ struct CompanionPanelView: View {
                 Spacer()
                     .frame(height: 16)
 
+                modelPickerRow
+                    .padding(.horizontal, 16)
+            }
+
+            if companionManager.hasCompletedOnboarding && companionManager.allPermissionsGranted {
+                Spacer()
+                    .frame(height: 16)
+
+                delegationTargetSection
+                    .padding(.horizontal, 16)
+            }
+
+            if companionManager.hasCompletedOnboarding && companionManager.allPermissionsGranted {
+                Spacer()
+                    .frame(height: 16)
+
                 WorkspaceInventorySectionView(workspaceInventoryStore: companionManager.workspaceInventoryStore)
                     .padding(.horizontal, 16)
             }
@@ -80,6 +100,13 @@ struct CompanionPanelView: View {
         }
         .frame(width: 320)
         .background(panelBackground)
+        .onAppear {
+            reloadDelegationPreferencesFromUserDefaults()
+            reconcileSelectedMulticaAgentName()
+        }
+        .onChange(of: multicaAvailableAgentNames) { _, _ in
+            reconcileSelectedMulticaAgentName()
+        }
     }
 
     // MARK: - Header
@@ -640,6 +667,159 @@ struct CompanionPanelView: View {
         }
         .buttonStyle(.plain)
         .pointerCursor()
+    }
+
+    // MARK: - Delegation Target
+
+    private var delegationTargetSection: some View {
+        VStack(alignment: .leading, spacing: DS.Spacing.sm) {
+            Text("Delegation target")
+                .font(.system(size: 10, weight: .semibold, design: .rounded))
+                .foregroundColor(DS.Colors.textTertiary)
+                .frame(maxWidth: .infinity, alignment: .leading)
+
+            HStack(spacing: DS.Spacing.xs) {
+                delegationTargetOptionButton(for: .localWorkspace)
+                delegationTargetOptionButton(for: .multica)
+            }
+            .padding(DS.Spacing.xs)
+            .background(
+                RoundedRectangle(cornerRadius: DS.CornerRadius.medium, style: .continuous)
+                    .fill(DS.Colors.surface2)
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: DS.CornerRadius.medium, style: .continuous)
+                    .stroke(DS.Colors.borderSubtle, lineWidth: 0.5)
+            )
+
+            if selectedDelegationTarget == .multica {
+                VStack(alignment: .leading, spacing: DS.Spacing.xs) {
+                    Text("Default agent")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundColor(DS.Colors.textSecondary)
+
+                    Menu {
+                        if multicaAvailableAgentNames.isEmpty {
+                            Text("No Multica agents available")
+                        } else {
+                            ForEach(multicaAvailableAgentNames, id: \.self) { multicaAgentName in
+                                Button(multicaAgentName) {
+                                    setSelectedMulticaDefaultAgentName(multicaAgentName)
+                                }
+                            }
+                        }
+                    } label: {
+                        HStack(spacing: DS.Spacing.sm) {
+                            Text(multicaAgentPickerLabel)
+                                .font(.system(size: 11, weight: .medium))
+                                .foregroundColor(multicaAvailableAgentNames.isEmpty ? DS.Colors.disabledText : DS.Colors.textPrimary)
+                                .lineLimit(1)
+
+                            Spacer()
+
+                            Image(systemName: "chevron.up.chevron.down")
+                                .font(.system(size: 10, weight: .semibold))
+                                .foregroundColor(multicaAvailableAgentNames.isEmpty ? DS.Colors.disabledText : DS.Colors.textTertiary)
+                        }
+                        .padding(.horizontal, DS.Spacing.md)
+                        .padding(.vertical, DS.Spacing.sm)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(
+                            RoundedRectangle(cornerRadius: DS.CornerRadius.medium, style: .continuous)
+                                .fill(DS.Colors.surface2)
+                        )
+                        .overlay(
+                            RoundedRectangle(cornerRadius: DS.CornerRadius.medium, style: .continuous)
+                                .stroke(DS.Colors.borderSubtle, lineWidth: 0.5)
+                        )
+                    }
+                    .menuStyle(.borderlessButton)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .disabled(multicaAvailableAgentNames.isEmpty)
+                    .pointerCursor(isEnabled: !multicaAvailableAgentNames.isEmpty)
+                }
+            }
+        }
+    }
+
+    private func delegationTargetOptionButton(for delegationTarget: DelegationTarget) -> some View {
+        let isSelected = selectedDelegationTarget == delegationTarget
+
+        return Button(action: {
+            setSelectedDelegationTarget(delegationTarget)
+        }) {
+            Text(delegationTarget.displayLabel)
+                .font(.system(size: 11, weight: .medium))
+                .foregroundColor(isSelected ? DS.Colors.textPrimary : DS.Colors.textTertiary)
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, DS.Spacing.sm)
+                .background(
+                    RoundedRectangle(cornerRadius: DS.CornerRadius.small, style: .continuous)
+                        .fill(isSelected ? DS.Colors.surface4 : DS.Colors.surface2)
+                )
+        }
+        .buttonStyle(.plain)
+        .pointerCursor()
+    }
+
+    private var multicaAgentPickerLabel: String {
+        if multicaAvailableAgentNames.isEmpty {
+            return "No Multica agents available"
+        }
+
+        if !selectedMulticaDefaultAgentName.isEmpty {
+            return selectedMulticaDefaultAgentName
+        }
+
+        return multicaAvailableAgentNames[0]
+    }
+
+    private var multicaAvailableAgentNames: [String] {
+        if let multicaAgentRegistry = Mirror(reflecting: companionManager).children.first(where: { $0.label == "multicaAgentRegistry" })?.value {
+            if let stubRegistry = multicaAgentRegistry as? MulticaAgentRegistry {
+                return stubRegistry.availableAgents.map(\.name)
+            }
+
+            if let availableAgentsValue = Mirror(reflecting: multicaAgentRegistry).children.first(where: { $0.label == "availableAgents" })?.value {
+                return Mirror(reflecting: availableAgentsValue).children.compactMap { availableAgentChild in
+                    Mirror(reflecting: availableAgentChild.value).children.first(where: { $0.label == "name" })?.value as? String
+                }
+            }
+        }
+
+        return []
+    }
+
+    private func setSelectedDelegationTarget(_ delegationTarget: DelegationTarget) {
+        selectedDelegationTarget = delegationTarget
+        companionManager.updateDelegationRoutingPreference(delegationTarget)
+    }
+
+    private func setSelectedMulticaDefaultAgentName(_ multicaAgentName: String) {
+        selectedMulticaDefaultAgentName = multicaAgentName
+        UserDefaults.standard.set(multicaAgentName, forKey: "ClickyMulticaDefaultAgentName")
+    }
+
+    private func reloadDelegationPreferencesFromUserDefaults() {
+        selectedDelegationTarget = UserDefaults.standard.string(forKey: "ClickyDelegationTargetKind")
+            .flatMap(DelegationTarget.init(rawValue:))
+            ?? companionManager.currentDelegationRoutingPreference
+        selectedMulticaDefaultAgentName = UserDefaults.standard.string(forKey: "ClickyMulticaDefaultAgentName") ?? ""
+        companionManager.updateDelegationRoutingPreference(selectedDelegationTarget)
+    }
+
+    private func reconcileSelectedMulticaAgentName() {
+        guard !multicaAvailableAgentNames.isEmpty else {
+            selectedMulticaDefaultAgentName = ""
+            UserDefaults.standard.removeObject(forKey: "ClickyMulticaDefaultAgentName")
+            return
+        }
+
+        if multicaAvailableAgentNames.contains(selectedMulticaDefaultAgentName) {
+            return
+        }
+
+        setSelectedMulticaDefaultAgentName(multicaAvailableAgentNames[0])
     }
 
     // MARK: - DM Farza Button
