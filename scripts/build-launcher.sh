@@ -4,25 +4,23 @@ set -euo pipefail
 export PATH="/opt/homebrew/bin:$PATH"
 
 SCHEME="leanring-buddy"
-APP_NAME="Clicky"
 PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 BUILD_ROOT="${PROJECT_DIR}/build/local-release"
-ARCHIVE_PATH="${BUILD_ROOT}/${APP_NAME}.xcarchive"
+ARCHIVE_PATH="${BUILD_ROOT}/launcher.xcarchive"
 STAGED_APP_DIR="${BUILD_ROOT}/launcher"
-STAGED_APP_PATH="${STAGED_APP_DIR}/${APP_NAME}.app"
-ZIP_PATH="${BUILD_ROOT}/${APP_NAME}.zip"
-INSTALL_DESTINATION="/Applications/${APP_NAME}.app"
 SHOULD_INSTALL=0
 
 usage() {
     cat <<EOF
 Usage: ./scripts/build-launcher.sh [--install]
 
-Builds a Release archive of Clicky and stages a standalone launcher app at:
-  build/local-release/launcher/Clicky.app
+Builds a Release archive of the leanring-buddy scheme and stages a
+standalone launcher app under build/local-release/launcher/. The exact
+.app bundle name is determined by Xcode's PRODUCT_NAME build setting
+and is auto-detected from the archive.
 
 Options:
-  --install    Replace /Applications/Clicky.app with the staged launcher
+  --install    Replace the installed launcher in /Applications
 EOF
 }
 
@@ -48,7 +46,7 @@ echo "🧹 Cleaning previous local release artifacts..."
 rm -rf "${BUILD_ROOT}"
 mkdir -p "${STAGED_APP_DIR}"
 
-echo "📦 Archiving ${APP_NAME} in Release mode..."
+echo "📦 Archiving in Release mode..."
 xcodebuild archive \
     -project "${PROJECT_DIR}/leanring-buddy.xcodeproj" \
     -scheme "${SCHEME}" \
@@ -56,14 +54,27 @@ xcodebuild archive \
     -destination "generic/platform=macOS" \
     -archivePath "${ARCHIVE_PATH}"
 
-ARCHIVED_APP_PATH="${ARCHIVE_PATH}/Products/Applications/${APP_NAME}.app"
+# Auto-detect the produced .app bundle name. Xcode's PRODUCT_NAME build
+# setting determines this — hardcoding the name here silently breaks the
+# script whenever the product is renamed (it already happened once when
+# Clicky was renamed to Flowee and this verification kept failing on
+# Clicky.app long after the archive started producing Flowee.app).
+ARCHIVED_APPLICATIONS_DIR="${ARCHIVE_PATH}/Products/Applications"
+ARCHIVED_APP_PATH="$(find "${ARCHIVED_APPLICATIONS_DIR}" -maxdepth 1 -name '*.app' -type d -print -quit 2>/dev/null || true)"
 
-if [ ! -d "${ARCHIVED_APP_PATH}" ]; then
-    echo "❌ Expected archived app at ${ARCHIVED_APP_PATH}, but it was not found." >&2
+if [ -z "${ARCHIVED_APP_PATH}" ] || [ ! -d "${ARCHIVED_APP_PATH}" ]; then
+    echo "❌ No .app bundle found in ${ARCHIVED_APPLICATIONS_DIR}" >&2
     exit 1
 fi
 
-echo "📁 Staging launcher app..."
+ARCHIVED_APP_BUNDLE_NAME="$(basename "${ARCHIVED_APP_PATH}")"
+ARCHIVED_APP_BUNDLE_NAME_WITHOUT_EXTENSION="${ARCHIVED_APP_BUNDLE_NAME%.app}"
+
+STAGED_APP_PATH="${STAGED_APP_DIR}/${ARCHIVED_APP_BUNDLE_NAME}"
+ZIP_PATH="${BUILD_ROOT}/${ARCHIVED_APP_BUNDLE_NAME_WITHOUT_EXTENSION}.zip"
+INSTALL_DESTINATION="/Applications/${ARCHIVED_APP_BUNDLE_NAME}"
+
+echo "📁 Staging ${ARCHIVED_APP_BUNDLE_NAME}..."
 ditto "${ARCHIVED_APP_PATH}" "${STAGED_APP_PATH}"
 
 echo "🗜️ Creating zip artifact..."
@@ -89,7 +100,7 @@ echo "   Zip artifact:  ${ZIP_PATH}"
 if [ "${SHOULD_INSTALL}" -eq 0 ]; then
     echo ""
     echo "   Next step:"
-    echo "   Move ${APP_NAME}.app into /Applications before launching it."
+    echo "   Move ${ARCHIVED_APP_BUNDLE_NAME} into /Applications before launching it."
     echo "   That is the installed launcher you can run without keeping Xcode open."
 fi
 echo "═══════════════════════════════════════════════════════════════"
