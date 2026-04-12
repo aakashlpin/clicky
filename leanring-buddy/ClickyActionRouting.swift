@@ -15,7 +15,12 @@ enum ClickyActionIntent: String, Codable, CaseIterable, Equatable {
 
 enum DelegationTarget: Equatable {
     case localWorkspace
-    case multica(assigneeAgentName: String)
+    /// A specific Multica agent living in a specific Multica workspace.
+    /// Clicky persists all three fields so a refresh of the registry
+    /// (e.g. an agent being renamed) does not silently re-route issues
+    /// to a different workspace — the stored selection is reconciled
+    /// against the fresh agent list on every panel open.
+    case multica(workspaceID: String, workspaceName: String, assigneeAgentName: String)
 }
 
 extension DelegationTarget {
@@ -66,6 +71,11 @@ struct MulticaIssueCreationRequest: Equatable {
     let title: String
     let description: String
     let attachmentFilePaths: [URL]
+    /// Workspace the issue should be filed into. The launcher passes
+    /// this to the CLI as `--workspace-id` so the user's menu bar
+    /// selection is honored even if the currently-watched workspace
+    /// in `~/.multica/config.json` points somewhere else.
+    let workspaceID: String
     let assigneeAgentName: String
     let priority: String?
 }

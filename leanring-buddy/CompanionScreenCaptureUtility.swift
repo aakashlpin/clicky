@@ -269,13 +269,15 @@ enum CompanionScreenCaptureUtility {
             return originalJpegData
         }
 
-        // CGContext defaults to bottom-left origin. Flipping the Y axis BEFORE we
-        // draw the image means all subsequent coordinates in this context are in
-        // top-left-origin space, which is easier to reason about when mapping from
-        // screenshot pixel math.
-        compositingContext.translateBy(x: 0, y: CGFloat(screenshotHeightInPixels))
-        compositingContext.scaleBy(x: 1, y: -1)
-
+        // CGBitmapContext defaults to bottom-left origin, which matches
+        // AppKit's coordinate system. We draw the decoded CGImage without
+        // any transform — draw(in:) renders it right-side-up in the user
+        // coordinate system, and the bottom-left origin produces correctly
+        // oriented pixel rows in the buffer. A previous version applied
+        // translateBy(0,H)+scaleBy(1,-1) to flip into top-left-origin
+        // space, but that inverted the drawn image (draw() maps the image's
+        // visual bottom to rect.minY, and the flip moved minY to the top
+        // of the buffer, producing a vertically inverted output).
         let fullScreenshotRectInPixels = CGRect(
             x: 0,
             y: 0,
@@ -284,14 +286,10 @@ enum CompanionScreenCaptureUtility {
         )
         compositingContext.draw(decodedCGImage, in: fullScreenshotRectInPixels)
 
-        // Convert the clamped focus rect from AppKit display-local points
-        // (bottom-left origin) to screenshot pixel coordinates (top-left origin).
-        //
-        // AppKit says the rect's bottom-left Y is clampedFocusRectangle.origin.y.
-        // To get the rect's TOP-left Y in the same bottom-left coordinate system
-        // we add its height, then subtract from displayHeight to flip the axis
-        // to top-left origin. Finally we scale by the per-axis screenshot-to-display
-        // ratio to land in screenshot pixel space.
+        // The focus rectangle is in AppKit display-local points (bottom-left
+        // origin), which matches the CGContext's default bottom-left origin.
+        // We only need to scale from display points to screenshot pixels —
+        // no Y-axis flip is needed.
         let displayWidthInDisplayPoints = displayFrame.width
         let displayHeightInDisplayPoints = displayFrame.height
 
@@ -303,12 +301,9 @@ enum CompanionScreenCaptureUtility {
         let screenshotToDisplayScaleX = CGFloat(screenshotWidthInPixels) / displayWidthInDisplayPoints
         let screenshotToDisplayScaleY = CGFloat(screenshotHeightInPixels) / displayHeightInDisplayPoints
 
-        let topLeftYInDisplayPoints = displayHeightInDisplayPoints
-            - (clampedFocusRectangleInDisplayPoints.origin.y + clampedFocusRectangleInDisplayPoints.height)
-
         let focusRectangleInScreenshotPixels = CGRect(
             x: clampedFocusRectangleInDisplayPoints.origin.x * screenshotToDisplayScaleX,
-            y: topLeftYInDisplayPoints * screenshotToDisplayScaleY,
+            y: clampedFocusRectangleInDisplayPoints.origin.y * screenshotToDisplayScaleY,
             width: clampedFocusRectangleInDisplayPoints.width * screenshotToDisplayScaleX,
             height: clampedFocusRectangleInDisplayPoints.height * screenshotToDisplayScaleY
         )
@@ -328,12 +323,9 @@ enum CompanionScreenCaptureUtility {
         // Encode via Core Graphics' native JPEG encoder (CGImageDestination).
         // We deliberately do NOT route through NSBitmapImageRep(cgImage:) here
         // because that wrapper reads the CGImage's backing store with its own
-        // assumptions about pixel row order, and for a CGImage that came out
-        // of a flipped CGBitmapContext the rows are in the opposite order
-        // from what NSBitmapImageRep expects — the result is a vertically
-        // inverted JPEG. CGImageDestinationAddImage preserves the CGImage's
-        // orientation metadata directly and produces a correct JPEG regardless
-        // of how the source context's CTM was configured during drawing.
+        // assumptions about pixel row order. CGImageDestinationAddImage
+        // preserves the CGImage's pixel data directly and produces a correct
+        // JPEG regardless of the source context's configuration.
         let jpegDestinationData = NSMutableData()
         guard let imageDestination = CGImageDestinationCreateWithData(
             jpegDestinationData,

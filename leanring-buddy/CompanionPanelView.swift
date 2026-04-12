@@ -19,12 +19,22 @@ struct CompanionPanelView: View {
         let storedKind = UserDefaults.standard.string(forKey: "ClickyDelegationTargetKind")
         let storedAgentName = UserDefaults.standard.string(forKey: "ClickyMulticaDefaultAgentName")?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        if storedKind == "multica" && !storedAgentName.isEmpty {
-            return .multica(assigneeAgentName: storedAgentName)
+        let storedAgentWorkspaceID = UserDefaults.standard.string(forKey: "ClickyMulticaDefaultAgentWorkspaceID")?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let storedAgentWorkspaceName = UserDefaults.standard.string(forKey: "ClickyMulticaDefaultAgentWorkspaceName")?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if storedKind == "multica" && !storedAgentName.isEmpty && !storedAgentWorkspaceID.isEmpty {
+            return .multica(
+                workspaceID: storedAgentWorkspaceID,
+                workspaceName: storedAgentWorkspaceName,
+                assigneeAgentName: storedAgentName
+            )
         }
         return .localWorkspace
     }()
     @State private var selectedMulticaDefaultAgentName: String = UserDefaults.standard.string(forKey: "ClickyMulticaDefaultAgentName") ?? ""
+    @State private var selectedMulticaDefaultAgentWorkspaceID: String = UserDefaults.standard.string(forKey: "ClickyMulticaDefaultAgentWorkspaceID") ?? ""
+    @State private var selectedMulticaDefaultAgentWorkspaceName: String = UserDefaults.standard.string(forKey: "ClickyMulticaDefaultAgentWorkspaceName") ?? ""
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -109,13 +119,13 @@ struct CompanionPanelView: View {
         .background(panelBackground)
         .onAppear {
             reloadDelegationPreferencesFromUserDefaults()
-            reconcileSelectedMulticaAgentName()
+            reconcileSelectedMulticaAgent()
         }
         .task {
             await multicaAgentRegistry.refreshAvailableAgents()
         }
-        .onChange(of: multicaAvailableAgentNames) { _, _ in
-            reconcileSelectedMulticaAgentName()
+        .onChange(of: multicaAgentRegistry.availableAgents) { _, _ in
+            reconcileSelectedMulticaAgent()
         }
     }
 
@@ -690,7 +700,7 @@ struct CompanionPanelView: View {
 
             HStack(spacing: DS.Spacing.xs) {
                 delegationTargetOptionButton(for: .localWorkspace)
-                delegationTargetOptionButton(for: .multica(assigneeAgentName: selectedMulticaDefaultAgentName))
+                delegationTargetOptionButton(for: currentMulticaDelegationTargetFromSelection)
             }
             .padding(DS.Spacing.xs)
             .background(
@@ -709,12 +719,12 @@ struct CompanionPanelView: View {
                         .foregroundColor(DS.Colors.textSecondary)
 
                     Menu {
-                        if multicaAvailableAgentNames.isEmpty {
+                        if multicaAgentRegistry.availableAgents.isEmpty {
                             Text("No Multica agents available")
                         } else {
-                            ForEach(multicaAvailableAgentNames, id: \.self) { multicaAgentName in
-                                Button(multicaAgentName) {
-                                    setSelectedMulticaDefaultAgentName(multicaAgentName)
+                            ForEach(multicaAgentRegistry.availableAgents) { availableMulticaAgent in
+                                Button(availableMulticaAgent.displayName) {
+                                    setSelectedMulticaAgent(availableMulticaAgent)
                                 }
                             }
                         }
@@ -722,14 +732,14 @@ struct CompanionPanelView: View {
                         HStack(spacing: DS.Spacing.sm) {
                             Text(multicaAgentPickerLabel)
                                 .font(.system(size: 11, weight: .medium))
-                                .foregroundColor(multicaAvailableAgentNames.isEmpty ? DS.Colors.disabledText : DS.Colors.textPrimary)
+                                .foregroundColor(multicaAgentRegistry.availableAgents.isEmpty ? DS.Colors.disabledText : DS.Colors.textPrimary)
                                 .lineLimit(1)
 
                             Spacer()
 
                             Image(systemName: "chevron.up.chevron.down")
                                 .font(.system(size: 10, weight: .semibold))
-                                .foregroundColor(multicaAvailableAgentNames.isEmpty ? DS.Colors.disabledText : DS.Colors.textTertiary)
+                                .foregroundColor(multicaAgentRegistry.availableAgents.isEmpty ? DS.Colors.disabledText : DS.Colors.textTertiary)
                         }
                         .padding(.horizontal, DS.Spacing.md)
                         .padding(.vertical, DS.Spacing.sm)
@@ -745,8 +755,8 @@ struct CompanionPanelView: View {
                     }
                     .menuStyle(.borderlessButton)
                     .fixedSize(horizontal: false, vertical: true)
-                    .disabled(multicaAvailableAgentNames.isEmpty)
-                    .pointerCursor(isEnabled: !multicaAvailableAgentNames.isEmpty)
+                    .disabled(multicaAgentRegistry.availableAgents.isEmpty)
+                    .pointerCursor(isEnabled: !multicaAgentRegistry.availableAgents.isEmpty)
                 }
             }
         }
@@ -773,19 +783,67 @@ struct CompanionPanelView: View {
     }
 
     private var multicaAgentPickerLabel: String {
-        if multicaAvailableAgentNames.isEmpty {
+        if multicaAgentRegistry.availableAgents.isEmpty {
             return "No Multica agents available"
         }
 
-        if !selectedMulticaDefaultAgentName.isEmpty {
-            return selectedMulticaDefaultAgentName
+        // Prefer the currently selected agent's normalized display name
+        // so the user sees "<workspace>-<agent>" consistently whether
+        // the selection came from fresh state or from UserDefaults.
+        if let resolvedSelectedAgent = currentlySelectedMulticaAgentRecord {
+            return resolvedSelectedAgent.displayName
         }
 
-        return multicaAvailableAgentNames[0]
+        // Fall back to the first available agent's display name if the
+        // selection is empty or stale; reconcileSelectedMulticaAgent
+        // will drive the state into sync on the next tick.
+        return multicaAgentRegistry.availableAgents[0].displayName
     }
 
-    private var multicaAvailableAgentNames: [String] {
-        multicaAgentRegistry.availableAgents.map(\.name)
+    /// Build a valid `.multica` delegation target from the current
+    /// selection state. Used when toggling the delegation target button
+    /// row so the kind comparison in `hasSameKind` always has something
+    /// to match against, even before the user has picked a specific
+    /// agent (in which case the first available agent is used).
+    private var currentMulticaDelegationTargetFromSelection: DelegationTarget {
+        if !selectedMulticaDefaultAgentName.isEmpty && !selectedMulticaDefaultAgentWorkspaceID.isEmpty {
+            return .multica(
+                workspaceID: selectedMulticaDefaultAgentWorkspaceID,
+                workspaceName: selectedMulticaDefaultAgentWorkspaceName,
+                assigneeAgentName: selectedMulticaDefaultAgentName
+            )
+        }
+
+        if let firstAvailableAgent = multicaAgentRegistry.availableAgents.first {
+            return .multica(
+                workspaceID: firstAvailableAgent.workspaceID.uuidString,
+                workspaceName: firstAvailableAgent.workspaceName,
+                assigneeAgentName: firstAvailableAgent.name
+            )
+        }
+
+        // No agents available at all — return a placeholder target so
+        // the kind-based comparison still works. The actual filing path
+        // will fail fast because routeDelegationToMulticaIssueFiling
+        // sees an empty assignee name.
+        return .multica(workspaceID: "", workspaceName: "", assigneeAgentName: "")
+    }
+
+    /// The `MulticaAgent` record matching the currently selected
+    /// workspace-ID + agent-name pair, if one is still in the
+    /// registry. Returns nil if the selection is empty or if the
+    /// underlying agent has disappeared (e.g. the workspace was
+    /// removed or the agent archived).
+    private var currentlySelectedMulticaAgentRecord: MulticaAgent? {
+        guard !selectedMulticaDefaultAgentName.isEmpty,
+              !selectedMulticaDefaultAgentWorkspaceID.isEmpty else {
+            return nil
+        }
+
+        return multicaAgentRegistry.availableAgents.first { multicaAgentCandidate in
+            multicaAgentCandidate.workspaceID.uuidString == selectedMulticaDefaultAgentWorkspaceID
+                && multicaAgentCandidate.name == selectedMulticaDefaultAgentName
+        }
     }
 
     private func setSelectedDelegationTarget(_ delegationTarget: DelegationTarget) {
@@ -793,38 +851,89 @@ struct CompanionPanelView: View {
         companionManager.updateDelegationRoutingPreference(delegationTarget)
     }
 
-    private func setSelectedMulticaDefaultAgentName(_ multicaAgentName: String) {
-        selectedMulticaDefaultAgentName = multicaAgentName
-        UserDefaults.standard.set(multicaAgentName, forKey: "ClickyMulticaDefaultAgentName")
+    /// Record a full `MulticaAgent` as the default delegation target.
+    /// Stores the three fields (workspace ID, workspace name, and raw
+    /// agent name) both in local SwiftUI state and in UserDefaults so
+    /// the selection survives an app restart and reconciles correctly
+    /// against the next registry refresh.
+    private func setSelectedMulticaAgent(_ multicaAgent: MulticaAgent) {
+        selectedMulticaDefaultAgentName = multicaAgent.name
+        selectedMulticaDefaultAgentWorkspaceID = multicaAgent.workspaceID.uuidString
+        selectedMulticaDefaultAgentWorkspaceName = multicaAgent.workspaceName
+
+        UserDefaults.standard.set(multicaAgent.name, forKey: "ClickyMulticaDefaultAgentName")
+        UserDefaults.standard.set(
+            multicaAgent.workspaceID.uuidString,
+            forKey: "ClickyMulticaDefaultAgentWorkspaceID"
+        )
+        UserDefaults.standard.set(
+            multicaAgent.workspaceName,
+            forKey: "ClickyMulticaDefaultAgentWorkspaceName"
+        )
+
+        // If the user has the Multica delegation target selected, push
+        // the new agent through to CompanionManager immediately so the
+        // next voice-triggered delegation routes to this agent.
+        if selectedDelegationTarget.isMulticaTarget {
+            setSelectedDelegationTarget(
+                .multica(
+                    workspaceID: multicaAgent.workspaceID.uuidString,
+                    workspaceName: multicaAgent.workspaceName,
+                    assigneeAgentName: multicaAgent.name
+                )
+            )
+        }
     }
 
     private func reloadDelegationPreferencesFromUserDefaults() {
         let storedKind = UserDefaults.standard.string(forKey: "ClickyDelegationTargetKind")
         let storedAgentName = UserDefaults.standard.string(forKey: "ClickyMulticaDefaultAgentName")?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        if storedKind == "multica" && !storedAgentName.isEmpty {
-            selectedDelegationTarget = .multica(assigneeAgentName: storedAgentName)
+        let storedAgentWorkspaceID = UserDefaults.standard.string(forKey: "ClickyMulticaDefaultAgentWorkspaceID")?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let storedAgentWorkspaceName = UserDefaults.standard.string(forKey: "ClickyMulticaDefaultAgentWorkspaceName")?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if storedKind == "multica" && !storedAgentName.isEmpty && !storedAgentWorkspaceID.isEmpty {
+            selectedDelegationTarget = .multica(
+                workspaceID: storedAgentWorkspaceID,
+                workspaceName: storedAgentWorkspaceName,
+                assigneeAgentName: storedAgentName
+            )
         } else if storedKind == "localWorkspace" {
             selectedDelegationTarget = .localWorkspace
         } else {
             selectedDelegationTarget = companionManager.currentDelegationRoutingPreference
         }
         selectedMulticaDefaultAgentName = UserDefaults.standard.string(forKey: "ClickyMulticaDefaultAgentName") ?? ""
+        selectedMulticaDefaultAgentWorkspaceID = UserDefaults.standard.string(forKey: "ClickyMulticaDefaultAgentWorkspaceID") ?? ""
+        selectedMulticaDefaultAgentWorkspaceName = UserDefaults.standard.string(forKey: "ClickyMulticaDefaultAgentWorkspaceName") ?? ""
         companionManager.updateDelegationRoutingPreference(selectedDelegationTarget)
     }
 
-    private func reconcileSelectedMulticaAgentName() {
-        guard !multicaAvailableAgentNames.isEmpty else {
+    /// Reconcile the currently selected Multica agent against the
+    /// registry's available agents. If the selection has gone stale
+    /// (e.g. the agent was archived, the workspace was removed, or the
+    /// selection was wiped by a failed refresh) fall back to the first
+    /// available agent so the picker label isn't left showing a ghost
+    /// name.
+    private func reconcileSelectedMulticaAgent() {
+        let availableMulticaAgents = multicaAgentRegistry.availableAgents
+
+        guard !availableMulticaAgents.isEmpty else {
             selectedMulticaDefaultAgentName = ""
+            selectedMulticaDefaultAgentWorkspaceID = ""
+            selectedMulticaDefaultAgentWorkspaceName = ""
             UserDefaults.standard.removeObject(forKey: "ClickyMulticaDefaultAgentName")
+            UserDefaults.standard.removeObject(forKey: "ClickyMulticaDefaultAgentWorkspaceID")
+            UserDefaults.standard.removeObject(forKey: "ClickyMulticaDefaultAgentWorkspaceName")
             return
         }
 
-        if multicaAvailableAgentNames.contains(selectedMulticaDefaultAgentName) {
+        if currentlySelectedMulticaAgentRecord != nil {
             return
         }
 
-        setSelectedMulticaDefaultAgentName(multicaAvailableAgentNames[0])
+        setSelectedMulticaAgent(availableMulticaAgents[0])
     }
 
     // MARK: - DM Farza Button

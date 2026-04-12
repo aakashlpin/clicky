@@ -28,11 +28,26 @@ private func loadStoredDelegationRoutingPreference() -> DelegationTarget {
 
     switch storedDelegationTargetKind {
     case "multica":
-        let storedMulticaAgentName = userDefaults.string(forKey: "ClickyMulticaDefaultAgentName")?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        guard !storedMulticaAgentName.isEmpty else {
+        let storedMulticaAgentName = userDefaults.string(forKey: "ClickyMulticaDefaultAgentName")?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let storedMulticaWorkspaceID = userDefaults.string(forKey: "ClickyMulticaDefaultAgentWorkspaceID")?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let storedMulticaWorkspaceName = userDefaults.string(forKey: "ClickyMulticaDefaultAgentWorkspaceName")?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+
+        // A Multica preference without a workspace ID is legacy state
+        // from before the picker supported multi-workspace selection.
+        // Fall back to localWorkspace so the next menu bar open can
+        // re-select a specific workspace-scoped agent before anything
+        // is filed.
+        guard !storedMulticaAgentName.isEmpty, !storedMulticaWorkspaceID.isEmpty else {
             return .localWorkspace
         }
-        return .multica(assigneeAgentName: storedMulticaAgentName)
+        return .multica(
+            workspaceID: storedMulticaWorkspaceID,
+            workspaceName: storedMulticaWorkspaceName,
+            assigneeAgentName: storedMulticaAgentName
+        )
     default:
         return .localWorkspace
     }
@@ -218,9 +233,11 @@ final class CompanionManager: NSObject, ObservableObject, NSSpeechSynthesizerDel
         switch newPreference {
         case .localWorkspace:
             UserDefaults.standard.set("localWorkspace", forKey: "ClickyDelegationTargetKind")
-        case let .multica(assigneeAgentName):
+        case let .multica(workspaceID, workspaceName, assigneeAgentName):
             UserDefaults.standard.set("multica", forKey: "ClickyDelegationTargetKind")
             UserDefaults.standard.set(assigneeAgentName, forKey: "ClickyMulticaDefaultAgentName")
+            UserDefaults.standard.set(workspaceID, forKey: "ClickyMulticaDefaultAgentWorkspaceID")
+            UserDefaults.standard.set(workspaceName, forKey: "ClickyMulticaDefaultAgentWorkspaceName")
         }
     }
 
@@ -1410,10 +1427,12 @@ final class CompanionManager: NSObject, ObservableObject, NSSpeechSynthesizerDel
         switch currentDelegationRoutingPreference {
         case .localWorkspace:
             break
-        case let .multica(assigneeAgentName):
+        case let .multica(workspaceID, workspaceName, assigneeAgentName):
             routeDelegationToMulticaIssueFiling(
                 transcript: transcript,
                 screenCaptures: screenCaptures,
+                workspaceID: workspaceID,
+                workspaceName: workspaceName,
                 assigneeAgentName: assigneeAgentName
             )
             return
@@ -1478,6 +1497,8 @@ final class CompanionManager: NSObject, ObservableObject, NSSpeechSynthesizerDel
     private func routeDelegationToMulticaIssueFiling(
         transcript: String,
         screenCaptures: [CompanionScreenCapture],
+        workspaceID: String,
+        workspaceName: String,
         assigneeAgentName: String
     ) {
         pendingDelegationScreenCaptures = []
@@ -1492,21 +1513,32 @@ final class CompanionManager: NSObject, ObservableObject, NSSpeechSynthesizerDel
             let multicaIssueContent = await self.multicaIssueContentGenerator.generateIssueContent(
                 transcript: transcript,
                 screenSummary: screenCaptures.map(\.label).joined(separator: " | "),
-                workspaceName: nil
+                workspaceName: workspaceName.isEmpty ? nil : workspaceName
             )
 
             let subdirectoryName = Self.makeMulticaAttachmentsSubdirectoryName(
                 fromTitle: multicaIssueContent.title
             )
-            let attachmentFileURLs = (try? await CompanionScreenCaptureUtility.persistCapturesToDisk(
-                screenCaptures,
-                intoSubdirectoryNamed: subdirectoryName
-            )) ?? []
+            let attachmentFileURLs: [URL]
+            do {
+                attachmentFileURLs = try CompanionScreenCaptureUtility.persistCapturesToDisk(
+                    screenCaptures,
+                    intoSubdirectoryNamed: subdirectoryName
+                )
+                print("📎 Multica attachments persisted: \(attachmentFileURLs.count) file(s)")
+                for attachmentFileURL in attachmentFileURLs {
+                    print("📎   \(attachmentFileURL.path)")
+                }
+            } catch {
+                print("⚠️ Multica attachment persistence failed: \(error)")
+                attachmentFileURLs = []
+            }
 
             let multicaIssueCreationRequest = MulticaIssueCreationRequest(
                 title: multicaIssueContent.title,
                 description: multicaIssueContent.description,
                 attachmentFilePaths: attachmentFileURLs,
+                workspaceID: workspaceID,
                 assigneeAgentName: assigneeAgentName,
                 priority: nil
             )

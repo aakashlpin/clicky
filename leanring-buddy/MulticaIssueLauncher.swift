@@ -21,6 +21,9 @@ final class MulticaIssueLauncher {
             attachmentFileURLs: existingAttachmentFileURLs
         )
 
+        print("📎 Multica CLI: \(multicaBinaryURL.path) \(processArguments.joined(separator: " "))")
+        print("📎 Multica attachments passed to CLI: \(existingAttachmentFileURLs.count) file(s)")
+
         let processResult = await Task.detached(priority: .userInitiated) {
             Self.runProcess(
                 executableURL: multicaBinaryURL,
@@ -29,9 +32,15 @@ final class MulticaIssueLauncher {
             )
         }.value
 
+        let trimmedStandardErrorForDiagnostics = processResult.standardError
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        print("📎 Multica CLI exit code: \(processResult.exitCode)")
+        if !trimmedStandardErrorForDiagnostics.isEmpty {
+            print("📎 Multica CLI stderr: \(trimmedStandardErrorForDiagnostics)")
+        }
+
         guard processResult.exitCode == 0 else {
-            let trimmedStandardError = processResult.standardError
-                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let trimmedStandardError = trimmedStandardErrorForDiagnostics
 
             if trimmedStandardError.localizedCaseInsensitiveContains("daemon") {
                 throw MulticaIssueCreationError.daemonNotRunning
@@ -100,7 +109,22 @@ final class MulticaIssueLauncher {
         request: MulticaIssueCreationRequest,
         attachmentFileURLs: [URL]
     ) -> [String] {
-        var processArguments = [
+        // The global `--workspace-id` flag is defined on the `multica`
+        // root command (see `multica --help`), so it has to come BEFORE
+        // the `issue create` subcommand. This makes the CLI file the
+        // issue into the workspace the user picked in the menu bar
+        // instead of whatever workspace `~/.multica/config.json` has
+        // currently configured as "watching".
+        var processArguments: [String] = []
+
+        let trimmedWorkspaceID = request.workspaceID
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmedWorkspaceID.isEmpty {
+            processArguments.append("--workspace-id")
+            processArguments.append(trimmedWorkspaceID)
+        }
+
+        processArguments.append(contentsOf: [
             "issue",
             "create",
             "--title",
@@ -111,7 +135,7 @@ final class MulticaIssueLauncher {
             request.assigneeAgentName,
             "--output",
             "json"
-        ]
+        ])
 
         for attachmentFileURL in attachmentFileURLs {
             processArguments.append("--attachment")
